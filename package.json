@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-        "@anthropic-ai/claude-code": "2.1.280",
+     "@anthropic-ai/claude-code": "2.1.239",
     "@gongrzhe/server-gmail-autoauth-mcp": "^1.1.11"
   }
 }
