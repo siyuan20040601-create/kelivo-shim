@@ -39,6 +39,8 @@ import { buildAuthEnv, authMode } from "./auth-env.js";
 import { SessionStore, requestKey } from "./session-state.js";
 import { writeStatus, validateText, DEFAULT_STATUS_FILE } from "./status.js";
 import { mountLookMcp } from "./status-mcp.js";
+import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
+import { mountWindowAdmin } from "./window-admin.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -149,6 +151,7 @@ function blockRecovery(reason) {
   clearTimeout(recoveryTimer);
   log("[session] blocked:", reason);
   if (turn) {
+    pushReceipt(turn, "interrupted");
     try { sessions?.fail(turn.key); } catch { log("[session] failed to save uncertain request"); }
     rejectSink(turn.sse, "会话恢复或保存失败：" + reason + "。自动重试已暂停，请检查服务后再继续。" +
       "修好后若要重发这条消息，请稍微改动措辞（加个字或标点即可）。");
@@ -212,6 +215,33 @@ if (SYSTEM_PROMPT_MODE === "replace" && process.env.SOUL_ANCHOR !== undefined)
 //      这一段只存在于窗口里,不及时归档就真的没了。
 const COMPACT_HOOK = process.env.COMPACT_HOOK !== "0";
 const WINDOW_LIMIT = +(process.env.WINDOW_LIMIT || DEFAULT_WINDOW_LIMIT);
+// 压缩线的真实来源(交接邮件 §2):CLI 开机会发 autocompact_state,带本会话**真实**的
+// 触发阈值 —— 比我们按 200k 公式猜的准(模型上限变了也不用改配置)。没收到之前,
+// 配置值也要夹回 200k 公式线:残留的 1M 旧配置不能让监控上限虚高、提醒永远不响。
+// 只有 CLI 自己确认了更大的阈值(真·扩展上下文),才按确认值放大。
+let cliThreshold = null; // CLI 报告的 autocompact 触发线(token)
+const windowLimitNow = () =>
+  cliThreshold > 0 ? Math.min(WINDOW_LIMIT, cliThreshold) : Math.min(WINDOW_LIMIT, DEFAULT_WINDOW_LIMIT);
+// 每个正常用户轮次的「验真回执」:只有元数据(模型名/档位/是否见到思考与签名/时长),
+// 不存任何聊天正文、思考正文或签名正文。内存环形,最多 20 条,/admin/window 展示。
+const receipts = [];
+function pushReceipt(t, status) {
+  if (!t || t.kind !== "user" || t.receiptDone) return;
+  t.receiptDone = true;
+  receipts.unshift({
+    requestedModel: t.requestedModel || null, configuredModel: spawnedModel,
+    upstreamModel: t.upstreamModel || null,
+    effectiveEffort: effortFor(spawnedModel),
+    effortSource: EFFORT_OVERRIDES[spawnedModel] ? "按模型覆盖" : "全局默认",
+    thinkingSeen: !!t.thinkingSeen, signatureSeen: !!t.signatureSeen,
+    signatureLength: t.signatureLength || 0,
+    startedAt: t.startedAt, completedAt: Date.now(), status,
+  });
+  if (receipts.length > 20) receipts.pop();
+}
+// 85%/90% 标记按会话持久化(window-threshold-state.js):恢复同一窗口不重复提醒/归档。
+const thresholds = new ThresholdState(
+  sessionDir ? (process.env.WINDOW_THRESHOLD_STATE_FILE || DEFAULT_THRESHOLD_FILE) : null, log);
 const WINDOW_WARN_PCT = +(process.env.WINDOW_WARN_PCT || 85);
 // 压缩前自动归档(owner 2026-07-31 要求):窗口到这个点,shim 主动注入一条【系统·窗口快满了】
 // 让 AI 自己在压缩吃掉记忆之前把这段存进 OB。默认 90%,在 85% 提醒她之后、硬压缩之前。
@@ -259,16 +289,18 @@ function compactSettingsArg() {
 // 刻意不往他的窗口里塞任何东西:2026-07-22 的伪系统指令事故教训 —— 运维提示走运维通道,
 // 归档还是要由她自己开口请求,那才是他们之间的约定而不是注入。
 function checkWindowUsage() {
-  if (!(WINDOW_LIMIT > 0)) return;
-  const pct = windowPct(windowTokens, WINDOW_LIMIT);
+  const limit = windowLimitNow();
+  if (!(limit > 0)) return;
+  const pct = windowPct(windowTokens, limit);
 
   // ① 到警戒线:提醒「她」(运维通道,不进他的窗口)
   if (!windowWarned && pct >= WINDOW_WARN_PCT) {
     windowWarned = true;
-    log("[window] usage", pct + "%", windowTokens, "/", WINDOW_LIMIT);
+    thresholds.set(nativeSessionId, { warned: true });
+    log("[window] usage", pct + "%", windowTokens, "/", limit);
     const k = (n) => Math.round(n / 1000) + "k";
     tgSend(
-      `⚠️ 窗口用到 ${pct}% 了(约 ${k(windowTokens)} / ${k(WINDOW_LIMIT)})。\n\n` +
+      `⚠️ 窗口用到 ${pct}% 了(约 ${k(windowTokens)} / ${k(limit)})。\n\n` +
       `我一会儿会自动让他把这段存一下(压缩前保底)。想换新窗口你随时说。`
     ).catch((e) => log("[tg-err]", e.message));
   }
@@ -277,6 +309,7 @@ function checkWindowUsage() {
   //    (这是早归档,不是最后防线;真正卡在压缩前一刻的是 /precompact-gate 闸门)
   if (WINDOW_AUTO_ARCHIVE && !windowAutoArchived && pct >= WINDOW_ARCHIVE_PCT) {
     windowAutoArchived = true;
+    thresholds.set(nativeSessionId, { archived: true });
     log("[window] auto-archive at", pct + "%");
     autoArchiveTurn(pct);
   }
@@ -301,7 +334,7 @@ function precompactGate() {
   // 后手:被拦下之后他不一定真的会去归档(理由文本能不能驱动他调工具,取决于 CLI 版本
   // 怎么把 reason 交给他)。所以 shim 自己也排一轮明确的归档请求 —— 两条路走通一条就行。
   // enqueue 走 busy 队列,不打断进行中的对话;archiveTurn 内部有成功校验与重试。
-  if (WINDOW_AUTO_ARCHIVE) autoArchiveTurn(windowPct(windowTokens, WINDOW_LIMIT), "gate");
+  if (WINDOW_AUTO_ARCHIVE) autoArchiveTurn(windowPct(windowTokens, windowLimitNow()), "gate");
   return { block: true, why: d.why, reason: GATE_REASON };
 }
 
@@ -492,10 +525,20 @@ const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 function handleEvent(ev) {
   if (recovery.phase === "failed") return;
+  // CLI 报告的本会话真实压缩线(开机即发,先于 init)。
+  if (ev.type === "autocompact_state") {
+    const t = +(ev.value?.threshold);
+    if (t > 0 && t !== cliThreshold) { cliThreshold = t; log("[window] CLI 压缩线", t); }
+    return;
+  }
   if (sessionDir && ev.type === "system" && ev.subtype === "init") {
     if (!ev.session_id || (resumeExpectedId && ev.session_id !== resumeExpectedId)) return blockRecovery("cli_resumed_wrong_session");
     nativeSessionId = ev.session_id;
     clearTimeout(recoveryTimer);
+    // 恢复同一会话:85%/90% 的「做过没有」从持久卷接回来,不重复提醒、不重复归档
+    const saved = thresholds.get(nativeSessionId);
+    if (saved.warned) windowWarned = true;
+    if (saved.archived) windowAutoArchived = true;
     // The first result must also be confirmed on disk before internal work is admitted.
     return;
   }
@@ -510,6 +553,7 @@ function handleEvent(ev) {
     lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
     windowTokens = 0; windowWarned = false; windowAutoArchived = false;
     compactBlocks = 0; archiveAttempts = 0;   // 压缩真的发生了 → 闸门预算与归档尝试都重新开始
+    thresholds.reset(nativeSessionId);        // 阈值标记随真实压缩一起重置
     log("[compact] boundary", ev.compact_metadata?.trigger || "?", "pre_tokens", lastCompactPre);
     // 压缩发生时还 dirty = 闸门没拦住(关了/预算用完/他没照做)→ 用原文回放补档,绝不认输
     if (dirty && COMPACT_REPLAY) replayTurn();
@@ -523,6 +567,7 @@ function handleEvent(ev) {
     if (e.type === "message_start") {
       const p = prefixFromMessageStart(e);
       if (p > turn.peakPrefix) turn.peakPrefix = p;
+      if (e.message?.model) turn.upstreamModel = e.message.model; // 验真回执:上游实际模型
     }
     if (e.type === "content_block_start") {
       const cb = e.content_block || {};
@@ -540,7 +585,8 @@ function handleEvent(ev) {
     }
     if (e.type === "content_block_delta") {
       if (d.type === "text_delta" && d.text) { const t = d.text.replace(/‖/g, "\n"); turn.fullText += t; turn.sse?.text(t); }
-      else if (d.type === "thinking_delta") { turn.sse?.thinking(d.thinking || d.text || ""); }
+      else if (d.type === "thinking_delta") { turn.thinkingSeen = true; turn.sse?.thinking(d.thinking || d.text || ""); }
+      else if (d.type === "signature_delta") { turn.signatureSeen = true; turn.signatureLength = (turn.signatureLength || 0) + String(d.signature || "").length; }
       else if (d.type === "input_json_delta" && turn.obBlocks[e.index]) { turn.obBlocks[e.index].buf += d.partial_json || ""; }
     }
     if (e.type === "content_block_stop" && turn.obBlocks[e.index]) {
@@ -588,7 +634,7 @@ function handleEvent(ev) {
   }
   if (ev.type === "result") {
     if (turn.committing) return;
-    if (ev.is_error || (ev.subtype && ev.subtype !== "success")) return blockRecovery("cli_result_" + (ev.subtype || "error"));
+    if (ev.is_error || (ev.subtype && ev.subtype !== "success")) { pushReceipt(turn, "upstream-error"); return blockRecovery("cli_result_" + (ev.subtype || "error")); }
     if (sessionDir && (!nativeSessionId || ev.session_id !== nativeSessionId)) return blockRecovery("cli_result_session_mismatch");
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
@@ -608,6 +654,7 @@ function handleEvent(ev) {
     // 9-02 那种伪装空响应会变成停机事故。空转改走温和复位:清场、存档点不动
     // (这一轮视同没发生,恢复时自动回滚)、去重 key 删掉让她能原样重发。
     if (sessionDir && !turn.fullText.trim() && !(ev.usage && ev.usage.output_tokens > 0)) {
+      pushReceipt(turn, "empty-result"); // zero-token 的"成功"不算 completed(交接邮件 §5)
       return haltRound("cli_empty_round");
     }
     // 窗口用量:用本轮各次请求里最大的那个真实前缀。
@@ -641,7 +688,7 @@ function handleEvent(ev) {
     if (turn.kind === "archive" && !archivedOk) {
       const src = turn.archiveSrc || "window";
       log("[archive] 这一轮没写进 OB(第", archiveAttempts, "次尝试)");
-      if (archiveAttempts < ARCHIVE_MAX_ATTEMPTS) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, WINDOW_LIMIT), src), 0);
+      if (archiveAttempts < ARCHIVE_MAX_ATTEMPTS) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, windowLimitNow()), src), 0);
       else tgSend(
         "⚠️ 让他自动归档试了两次都没成功写进 OB(可能是记忆服务出问题了)。\n" +
         "压缩不会再被一直拦着,这段有丢失风险 —— 要不要你亲口让他存一次?"
@@ -653,6 +700,7 @@ function handleEvent(ev) {
     // ⚠️ 防打转的命根子:结果轮(kind=lookup)自己再写标记一律不理,否则无限循环。
     // 换窗那轮也不查——进程马上要被杀,查了会变成新窗口的第一句话。
     const wantsLookup = wantsCheck && turn.kind !== "lookup" && !doKill;
+    pushReceipt(turn, "completed");
     const finished = turn;
     finished.committing = true;
     sessions.complete({
@@ -706,6 +754,7 @@ function pump() {
     sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
     kind: item.kind || "user", archiveSrc: item.archiveSrc,
     input: (item.kind || "user") === "user" ? item.text : undefined, images: item.images || [], key: item.key,
+    requestedModel: item.requestedModel || null, startedAt: Date.now(),
   };
   try { sessions.begin(item.key); }
   catch (e) { blockRecovery(sessionReason(e)); return; }
@@ -795,8 +844,8 @@ app.get("/debug", (_q, r) => r.json({
   },
   // 窗口离自动压缩还有多远 + 压缩到底发生过没有(排查时先看这里)
   window: {
-    tokens: windowTokens, limit: WINDOW_LIMIT,
-    pct: windowPct(windowTokens, WINDOW_LIMIT), warnPct: WINDOW_WARN_PCT, warned: windowWarned,
+    tokens: windowTokens, limit: windowLimitNow(), configuredLimit: WINDOW_LIMIT, cliThreshold,
+    pct: windowPct(windowTokens, windowLimitNow()), warnPct: WINDOW_WARN_PCT, warned: windowWarned,
     autoArchive: WINDOW_AUTO_ARCHIVE, archivePct: WINDOW_ARCHIVE_PCT, autoArchived: windowAutoArchived,
     compactHook: COMPACT_HOOK, compactions,
     lastCompactAt: lastCompactAt ? new Date(lastCompactAt).toISOString() : null,
@@ -845,6 +894,31 @@ app.get("/debug", (_q, r) => r.json({
     lastSpokeAt: lastSpokeAt ? new Date(lastSpokeAt).toISOString() : null,
   },
 }));
+
+// ---- 只读管理页:/admin/window(window-admin.js) -----------------------------
+// 手机上看窗口进度与验真回执。纯只读:快照只抄内存变量,没有任何通往队列/进程的路径。
+let ccVersionCache = null;
+function ccVersion() {
+  if (ccVersionCache !== null) return ccVersionCache;
+  try { ccVersionCache = execFileSync(CLAUDE_BIN, ["--version"], { encoding: "utf8", timeout: 15000 }).trim().slice(0, 60); }
+  catch { ccVersionCache = ""; }
+  return ccVersionCache;
+}
+function adminSnapshot() {
+  return {
+    tokens: windowTokens, limit: windowLimitNow(), configuredLimit: WINDOW_LIMIT,
+    limitSource: cliThreshold ? "CLI 实报(autocompact_state)" : "200k 公式线(CLI 尚未报告)",
+    warnPct: WINDOW_WARN_PCT, archivePct: WINDOW_ARCHIVE_PCT,
+    warned: windowWarned, archived: windowAutoArchived,
+    compactions, lastCompactAt, lastCompactPre,
+    bufferedChars: transcript.reduce((n, e) => n + e.text.length, 0), gateDirty: dirty,
+    deadStreak: deadWatch.state.streak,
+    sessionPhase: recovery.phase, sessionMode: recovery.mode, sessionError: recovery.error,
+    busy, queued: queue.length, receipts, ccVersion: ccVersion(),
+  };
+}
+if (SHIM_KEY) mountWindowAdmin(app, { key: SHIM_KEY, snapshot: adminSnapshot, log });
+else log("[admin] SHIM_KEY 未设置,/admin/window 不挂载");
 
 // 压缩闸门:PreCompact 钩子在压缩发生前问这里「能压吗」。
 // 钩子和 shim 在同一个容器里(claude 是 shim 的子进程),所以走 127.0.0.1,鉴权沿用 SHIM_KEY。
@@ -1824,7 +1898,7 @@ function submitTurn(text, images, sink, opts = {}) {
   if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
   lastUserAt = Date.now(); // 自主时间空闲计时基准
   log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-" });
-  enqueue({ text, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel, key: opts.key });
+  enqueue({ text, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel, key: opts.key, requestedModel: opts.requestedModel });
 }
 
 function handleMessages(req, res) {
@@ -1847,7 +1921,7 @@ function handleMessages(req, res) {
   // 一个安全阀只有一半入口有,等于没有。
   (async () => {
     const ctl = images.length ? null : await handsControlText(text);
-    if (ctl === null) return submitTurn(text, images, sse, { system, model, src: "kelivo", key });
+    if (ctl === null) return submitTurn(text, images, sse, { system, model, src: "kelivo", key, requestedModel: body.model || null });
     log("[hands] Kelivo 侧控制指令");
     sse.text(ctl);
     sse.finish(undefined, ctl);
