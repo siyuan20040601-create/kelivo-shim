@@ -36,6 +36,7 @@ import {
 } from "./system-prompt.js";
 import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
 import { buildAuthEnv, authMode } from "./auth-env.js";
+import { SessionStore, requestKey } from "./session-state.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -112,6 +113,40 @@ const ALLOWED = process.env.ALLOWED_TOOLS ||
   ["WebSearch", "WebFetch", "mcp__ombre", "mcp__fish", "mcp__gmail"].join(",");
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+const sessionReason = (e) => e.code ? "session_io_" + e.code
+  : /^[a-z_]+$/.test(e.message) ? e.message : "session_state_error";
+const sessionDir = process.env.SHIM_SESSION_DIR || null;
+let sessions;
+const recovery = { phase: sessionDir ? "pending" : "disabled", mode: null, error: null };
+try { sessions = new SessionStore({ dir: sessionDir }); }
+catch (e) {
+  recovery.phase = "failed"; recovery.error = sessionReason(e);
+  log("[session] startup blocked:", recovery.error);
+}
+let nativeSessionId = null, resumeExpectedId = null, recoveryTimer = null;
+let resumeSupported = null;
+const recoveryStatus = () => ({ enabled: !!sessionDir, phase: recovery.phase, mode: recovery.mode, error: recovery.error });
+const internalReady = () => !sessionDir || (recovery.phase === "ready" && !!nativeSessionId && !!proc);
+function rejectSink(sink, message, status = 503) {
+  // Internal sinks must never turn a failed round into a normal/pushed reply.
+  if (sink?.error) sink.error(message, status);
+  else log("[session] internal round blocked:", message);
+}
+function blockRecovery(reason) {
+  if (recovery.phase === "failed") return;
+  recovery.phase = "failed"; recovery.error = reason;
+  clearTimeout(recoveryTimer);
+  log("[session] blocked:", reason);
+  if (turn) {
+    try { sessions?.fail(turn.key); } catch { log("[session] failed to save uncertain request"); }
+    rejectSink(turn.sse, "会话恢复或保存失败：" + reason + "。自动重试已暂停，请检查服务后再继续。");
+    turn = null;
+  }
+  busy = false;
+  for (const item of queue.splice(0)) rejectSink(item.sse, "会话未就绪，消息没有发送。请检查服务。");
+  const old = proc; proc = null; nativeSessionId = null;
+  old?.kill();
+}
 
 // replace 模式下锚点已并入正文,SOUL_ANCHOR 不再参与组装 —— 有人设了它却没生效是最难查的那种。
 if (SYSTEM_PROMPT_MODE === "replace" && process.env.SOUL_ANCHOR !== undefined)
@@ -160,7 +195,7 @@ let dirty = false;
 let lastArchiveAt = null;    // 上次成功归档的时刻
 let compactBlocks = 0;       // 本窗口拦过几次压缩(压缩真的发生 / 换窗后清零)
 let archiveAttempts = 0;     // 当前这轮「请他归档」试了几次(成功或换窗后清零)
-// 自上次成功归档以来的原文([{role,text}]),只在内存里、不落盘不打日志 —— 这是他们的私话。
+// 自上次成功归档以来的原文([{role,text}])。启用持久化时只保存到私有卷,不打日志。
 let transcript = [];
 let replayPending = false;   // 已经排了一轮「照原文补档」,别重复排(崩溃连环重启时会撞上)
 
@@ -277,7 +312,8 @@ function replayTurn(entries = transcript) {
 }
 
 // ---- 常驻 claude 进程 --------------------------------------------------------
-let proc = null, outBuf = "", busy = false, spawnedSystem = "", spawnedModel = MODEL;
+let proc = null, outBuf = "", busy = false;
+let spawnedSystem = sessions?.state.context?.system || "", spawnedModel = sessions?.state.context?.model || MODEL;
 // 实际生效的模式(replace 可能因 CLI 不支持而降级)。spawn 之前是 null ——
 // /debug 那里如实报「还没起进程」,不要让面板显示一个还没验证过的 replace(手册 §9:
 // 一个看起来对、其实还没生效的读数,比没有读数更能把人带沟里)。
@@ -295,6 +331,18 @@ const deadWatch = createDeadTurnWatch({
 });
 
 function spawnClaude(kelivoSystem, model) {
+  if (recovery.phase === "failed") throw new Error(recovery.error);
+  const restored = sessions.restore();
+  if (sessionDir) {
+    recovery.phase = "restoring"; recovery.mode = restored.kind;
+    resumeExpectedId = restored.expectedId || null; nativeSessionId = null;
+    if (restored.kind === "native") {
+      if (resumeSupported === null) {
+        resumeSupported = /--resume[ <]/.test(execFileSync(CLAUDE_BIN, ["--help"], { encoding: "utf8", timeout: 30000 }));
+      }
+      if (!resumeSupported) throw new Error("cli_resume_not_supported");
+    }
+  }
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
   spawnedSystem = kelivoSystem ?? spawnedSystem;
   spawnedModel = model || spawnedModel || MODEL;
@@ -307,6 +355,11 @@ function spawnClaude(kelivoSystem, model) {
     anchor: SOUL_ANCHOR, base: SYSTEM_PROMPT, hardRule: HARD_RULE,
   });
   promptMode = prompt.mode;
+  if (restored.history) {
+    const i = prompt.args.indexOf("--append-system-prompt");
+    if (i >= 0) prompt.args[i + 1] += restored.history;
+    else prompt.args.push("--append-system-prompt", restored.history);
+  }
   for (const n of prompt.notes) log("[sysprompt]", n);
   const args = [
     "-p",
@@ -323,29 +376,42 @@ function spawnClaude(kelivoSystem, model) {
     "--permission-mode", "dontAsk",
     "--allowedTools", ALLOWED,
     "--tools", BUILTIN_TOOLS,
+    ...restored.args,
   ];
   if (COMPACT_HOOK) args.push("--settings", compactSettingsArg());
-  // 新进程 = 新窗口,用量重新数起。闸门状态同样重置。
-  // ⚠️ 但换窗时如果还有没归档的内容(崩溃自动重启、或改世界书/模型触发的重启 ——
-  // 主动换窗有安全阀,归档成功才会走到这里),那段在他窗口里已经没了、只剩 shim 手上这份。
-  // 所以先接出来,新窗口一起来就回放给他补档。
-  const carry = COMPACT_REPLAY && dirty && transcript.length ? transcript.slice() : null;
-  windowTokens = 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
-  dirty = false; compactBlocks = 0; archiveAttempts = 0; transcript = [];
+  // Native recovery restores the confirmed transcript and gate without replay.
+  // Legacy mode retains its original compact-replay behavior.
+  const carry = !sessionDir && COMPACT_REPLAY && dirty && transcript.length ? transcript.slice() : null;
+  const savedGate = sessionDir && restored.kind !== "fresh" ? sessions.state.gate : null;
+  windowTokens = savedGate?.windowTokens || 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
+  dirty = savedGate?.dirty || false; compactBlocks = 0; archiveAttempts = 0; transcript = savedGate?.transcript || [];
+  lastArchiveAt = savedGate?.lastArchiveAt || null;
   if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); setTimeout(() => replayTurn(carry), 0); }
   // 上游凭据:设了长期令牌就直连订阅,否则照旧经 CPA 中转。
   // ⚠️ 直连必须连 ANTHROPIC_AUTH_TOKEN/BASE_URL 一起摘 —— 它们优先级更高,
   //    不摘就会静默压过长期令牌(理由与实测见 auth-env.js 顶部)。
   const env = buildAuthEnv(process.env);
   const p = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
-  p.stdout.on("data", onStdout);
+  outBuf = "";
+  p.stdout.on("data", (d) => { if (proc === p) onStdout(d); });
   p.stderr.on("data", (d) => log("[claude]", d.toString().slice(0, 300)));
   p.on("close", (code) => {
     log("[claude] exited", code);
-    proc = null; busy = false;
-    if (turn && !turn.done) { try { turn.sse?.finish(); } catch {} turn = null; }
-    setTimeout(ensureProc, 1500);
+    if (proc !== p) return; // An old process cannot clear a newer session/turn.
+    proc = null;
+    if (turn?.committing) return; // The successful result is being made durable.
+    if (turn || queue.length || recovery.phase === "restoring") {
+      blockRecovery("cli_exited_before_confirmed_result");
+    } else if (sessionDir) {
+      recovery.phase = "pending"; nativeSessionId = null;
+    } else { busy = false; }
   });
+  p.on("error", () => { if (proc === p) blockRecovery("cli_spawn_failed"); });
+  p.stdin.on("error", () => { if (proc === p && turn) blockRecovery("cli_input_failed"); });
+  if (sessionDir) {
+    clearTimeout(recoveryTimer);
+    recoveryTimer = setTimeout(() => blockRecovery("cli_recovery_timeout"), 90000);
+  }
   log("[claude] spawned", spawnedModel, "sysLen", spawnedSystem.length, "prompt", promptMode,
       "auth", authMode(process.env));
   return p;
@@ -377,6 +443,15 @@ const archiveCallIds = new Set(); // 本轮 archive_session 调用的 tool_use_i
 const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 function handleEvent(ev) {
+  if (recovery.phase === "failed") return;
+  if (sessionDir && ev.type === "system" && ev.subtype === "init") {
+    if (!ev.session_id || (resumeExpectedId && ev.session_id !== resumeExpectedId)) return blockRecovery("cli_resumed_wrong_session");
+    nativeSessionId = ev.session_id;
+    clearTimeout(recoveryTimer);
+    // The first result must also be confirmed on disk before internal work is admitted.
+    return;
+  }
+  if (sessionDir && ev.type === "stream_event" && !nativeSessionId) return blockRecovery("cli_output_before_session_verified");
   // 压缩发生了 —— CLI 的硬信号,不必靠肉眼看思考链猜。
   // compact_metadata.pre_tokens = 压缩前的窗口大小(权威值,比我们的估算准)。
   // 压缩后窗口只剩「一行摘要 + 系统提示词」,所以用量归零重新数、提醒也重新武装。
@@ -464,6 +539,9 @@ function handleEvent(ev) {
     return;
   }
   if (ev.type === "result") {
+    if (turn.committing) return;
+    if (ev.is_error || (ev.subtype && ev.subtype !== "success")) return blockRecovery("cli_result_" + (ev.subtype || "error"));
+    if (sessionDir && (!nativeSessionId || ev.session_id !== nativeSessionId)) return blockRecovery("cli_result_session_mismatch");
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
     // 空转看门狗:正文空 + output token 零 = 这一轮压根没跑起来(≠ 他回【沉默】)。
@@ -481,10 +559,6 @@ function handleEvent(ev) {
     // 不跨轮取 max —— 数值本身已经准确,跨轮钉死只会让某次异常永远修不回来
     // (上一版正是因为 Math.max + 顶层累加值,一次虚报就把 32% 永久显示成 97%)。
     if (turn.peakPrefix > 0) { windowTokens = turn.peakPrefix; checkWindowUsage(); }
-    if (ev.subtype && ev.subtype !== "success") {
-      log("[result-error]", ev.subtype);
-      if (!turn.fullText) turn.sse?.text(`⚠️[shim] ${ev.subtype}`);
-    }
     const wantSwitch = turn.newWindow;
     const archivedOk = turn.archiveOk;
     // [查岗] 是他对系统说的话,不是对她说的:在这里一次剥干净,Telegram / Kelivo 非流式 /
@@ -524,18 +598,29 @@ function handleEvent(ev) {
     // ⚠️ 防打转的命根子:结果轮(kind=lookup)自己再写标记一律不理,否则无限循环。
     // 换窗那轮也不查——进程马上要被杀,查了会变成新窗口的第一句话。
     const wantsLookup = wantsCheck && turn.kind !== "lookup" && !doKill;
-    turn.done = true;
-    turn.sse?.finish(usage, outText, { wantsCheck });
-    turn = null;
-    busy = false;
-    if (doKill) { log("[window] archived ok, restarting proc"); try { proc.kill(); } catch {} proc = null; }
-    pump();
-    if (wantsLookup) queueLookup();
+    const finished = turn;
+    finished.committing = true;
+    sessions.complete({
+      id: nativeSessionId, input: finished.input, output: finished.fullText,
+      images: finished.images, key: finished.key, usage,
+      context: { system: spawnedSystem, model: spawnedModel },
+      gate: { dirty, transcript, lastArchiveAt, windowTokens },
+    }).then(() => {
+      if (turn !== finished || recovery.phase === "failed") return;
+      if (doKill) sessions.reset(); // Explicit, successfully archived window switch only.
+      if (sessionDir) recovery.phase = doKill || !proc ? "pending" : "ready";
+      finished.done = true;
+      finished.sse?.finish(usage, outText, { wantsCheck });
+      turn = null; busy = false;
+      if (doKill) { log("[window] archived ok, restarting proc"); const old = proc; proc = null; old?.kill(); }
+      pump();
+      if (wantsLookup) queueLookup();
+    }).catch((e) => blockRecovery(sessionReason(e)));
   }
 }
 
 // ---- 队列 / 喂消息 -----------------------------------------------------------
-// 原文缓冲:只进内存、不落盘、不打日志(这是他们俩的私话)。成功归档即清空。
+// 原文缓冲:仅私有卷持久化,不打日志。成功归档即清空。
 function recordTranscript(role, text) {
   if (!COMPACT_REPLAY) return;
   const t = (text || "").replace(/‖/g, "\n").trim();
@@ -543,7 +628,14 @@ function recordTranscript(role, text) {
   transcript.push({ role, text: t });
   transcript = trimTranscript(transcript, COMPACT_REPLAY_MAX_CHARS);
 }
-function enqueue(item) { queue.push(item); pump(); }
+function enqueue(item) {
+  if (recovery.phase === "failed") return rejectSink(item.sse, "会话未就绪：" + recovery.error);
+  if ((item.kind || "user") !== "user" && !internalReady()) return rejectSink(item.sse, "会话恢复完成前，自动消息已暂停。");
+  if (item.key && (sessions.entry(item.key) || queue.some((q) => q.key === item.key) || turn?.key === item.key)) {
+    return rejectSink(item.sse, "这条消息已提交过；为避免重复发送，本次请求已停止。", 409);
+  }
+  queue.push(item); pump();
+}
 function pump() {
   if (busy || !queue.length) return;
   const item = queue.shift();
@@ -552,18 +644,24 @@ function pump() {
   // 世界书或模型变了就重启进程再喂(让新设定/新模型生效)
   const wantModel = item.model || spawnedModel;
   if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
-  ensureProc(item.system, wantModel);
+  try { ensureProc(item.system, wantModel); }
+  catch (e) { const reason = sessionReason(e); rejectSink(item.sse, "恢复失败：" + reason); blockRecovery(reason); return; }
 
   turn = {
     sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
     kind: item.kind || "user", archiveSrc: item.archiveSrc,
+    input: (item.kind || "user") === "user" ? item.text : undefined, images: item.images || [], key: item.key,
   };
+  try { sessions.begin(item.key); }
+  catch (e) { blockRecovery(sessionReason(e)); return; }
   // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
   // 它们不是他们俩说的话,记了只会挤掉真正该留的内容。
   if (turn.kind === "user") recordTranscript("user", item.text);
   const content = item.images && item.images.length
     ? [{ type: "text", text: item.text }, ...item.images]
     : item.text;
+  // Native --resume restores its transcript before interpreting this input.
+  // No inference output is accepted until the CLI confirms the expected session.
   proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
 }
 
@@ -572,7 +670,7 @@ function makeSSE(res) {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const send = (event, data) => { if (!res.destroyed && !res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24);
   let started = false, cur = null, idx = -1;
 
@@ -589,6 +687,7 @@ function makeSSE(res) {
   function close() { if (cur === null) return; send("content_block_stop", { type: "content_block_stop", index: idx }); cur = null; }
 
   return {
+    error(message) { send("error", { type: "error", error: { type: "session_error", message } }); if (!res.destroyed) res.end(); },
     text(t) { ensureStart(); open("text"); send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: t } }); },
     thinking(t) { if (!FORWARD_THINKING || !t) return; ensureStart(); open("thinking"); send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: t } }); },
     finish(usage) { ensureStart(); close(); send("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: usage || { output_tokens: 0 } }); send("message_stop", { type: "message_stop" }); try { res.end(); } catch {} },
@@ -599,6 +698,7 @@ function makeSSE(res) {
 function makeCollector(res) {
   return {
     text() {}, thinking() {},
+    error(message, status = 503) { if (!res.destroyed) res.status(status).json({ type: "error", error: { type: "session_error", message } }); },
     finish(usage, fullText) {
       res.json({ id: "msg_" + randomUUID().replace(/-/g, "").slice(0, 24), type: "message", role: "assistant", model: spawnedModel, content: [{ type: "text", text: fullText || "" }], stop_reason: "end_turn", stop_sequence: null, usage: usage || { input_tokens: 0, output_tokens: 0 } });
     },
@@ -628,8 +728,9 @@ const app = express();
 app.use(express.json({ limit: "100mb" }));
 // auth 只报 "direct"/"proxy" 两个字,不泄露任何值 —— 有了它,
 // 切换之后不用进容器就能确认到底换没换路(exec 会进他活着的那个容器,能少进就少进)。
-app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length, auth: authMode(process.env) }));
+app.get("/health", (_q, r) => r.json({ ok: recovery.phase !== "failed", model: spawnedModel, models: MODELS, busy, queued: queue.length, auth: authMode(process.env), session: recoveryStatus() }));
 app.get("/debug", (_q, r) => r.json({
+  session: recoveryStatus(),
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   // 系统提示词:append=CC 默认那份还在(锚点压着);replace=已整段换掉(前缀少约 4800 token)
   systemPrompt: {
@@ -800,19 +901,20 @@ function wakeTurn(idleUserMin) {
   });
 }
 function wakeTick(force) {
-  if (busy || queue.length) return;
+  if (busy || queue.length || !internalReady()) return false;
   const idleTurnMin = (Date.now() - lastTurnAt) / 60000;
   const threshold = wakeIdleMin();
-  if (!force && idleTurnMin < threshold) return;
+  if (!force && idleTurnMin < threshold) return false;
   log("[wake] idle", Math.round(idleTurnMin), "min", `(阈值 ${threshold},${isDaytime() ? "白天" : "夜里"})`, force ? "(forced)" : "");
   wakeTurn((Date.now() - lastUserAt) / 60000);
+  return true;
 }
 setInterval(wakeTick, WAKE_CHECK_MIN * 60000);
 // 手动触发口(测试用):POST /hb?key=<SHIM_KEY>
 app.post("/hb", (req, res) => {
   if (SHIM_KEY && (req.query.key || req.get("x-api-key")) !== SHIM_KEY) return res.status(401).json({ ok: false });
-  wakeTick(true);
-  res.json({ ok: true, triggered: true });
+  const triggered = wakeTick(true);
+  res.json({ ok: recovery.phase !== "failed", triggered, session: recoveryStatus() });
 });
 
 // ---- 音色热更新:换音色/调参数不用重启(= 不换窗口) --------------------------
@@ -1319,6 +1421,7 @@ async function handleTgMessage(m) {
   let think = "";
   const sink = {
     text() {}, thinking(t) { if (TG_THINKING) think += t; },
+    error(message) { clearInterval(typing); tgSend("[shim] " + message).catch((e) => log("[tg-err]", e.message)); },
     finish(_u, fullText, meta) {
       clearInterval(typing);
       const t = (fullText || "").replace(/‖/g, "\n").trim();
@@ -1330,7 +1433,7 @@ async function handleTgMessage(m) {
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
-  submitTurn(text, images, sink, { src: "telegram" });
+  submitTurn(text, images, sink, { src: "telegram", key: requestKey({}, `telegram:${tgChatId}:${m.message_id}`) });
 }
 async function tgPoll() {
   log("[tg] long-poll started");
@@ -1638,7 +1741,7 @@ function submitTurn(text, images, sink, opts = {}) {
   if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
   lastUserAt = Date.now(); // 自主时间空闲计时基准
   log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-" });
-  enqueue({ text, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel });
+  enqueue({ text, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel, key: opts.key });
 }
 
 function handleMessages(req, res) {
@@ -1655,18 +1758,19 @@ function handleMessages(req, res) {
   const stream = body.stream !== false;
   // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
   const model = MODELS.includes(body.model) ? body.model : spawnedModel;
+  const key = requestKey(body, req.get("idempotency-key") || req.get("x-shim-message-id") || "");
   const sse = stream ? makeSSE(res) : makeCollector(res);
   // 急停 / 看活儿:Kelivo 这边同样管用。⚠️ 这条别删 —— 她在哪个前端说「停」都该停,
   // 一个安全阀只有一半入口有,等于没有。
   (async () => {
     const ctl = images.length ? null : await handsControlText(text);
-    if (ctl === null) return submitTurn(text, images, sse, { system, model, src: "kelivo" });
+    if (ctl === null) return submitTurn(text, images, sse, { system, model, src: "kelivo", key });
     log("[hands] Kelivo 侧控制指令");
     sse.text(ctl);
     sse.finish(undefined, ctl);
   })().catch((e) => {
     log("[hands-ctl-err]", e.message);
-    submitTurn(text, images, sse, { system, model, src: "kelivo" });   // 出岔子就当普通消息,绝不吞
+    submitTurn(text, images, sse, { system, model, src: "kelivo", key });
   });
 }
 
@@ -1675,3 +1779,5 @@ app.post("/v1/messages", handleMessages);
 app.post("/messages", handleMessages);
 
 app.listen(PORT, () => log(`kelivo-shim on :${PORT} model=${MODEL} thinking=${FORWARD_THINKING}`));
+process.once("SIGTERM", () => { proc?.kill(); process.exit(0); });
+process.once("SIGINT", () => { proc?.kill(); process.exit(0); });

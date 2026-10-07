@@ -98,4 +98,13 @@ fi
 # Trust the workspace so CLAUDE.md loads cleanly (permissions come from --allowedTools).
 printf '%s' '{"hasCompletedOnboarding":true,"projects":{"/src":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true}}}' > "${HOME:-/root}/.claude.json"
 
+# Native conversation storage must be prepared before any Claude subprocess.
+# The existing volume is required; a missing mount must never start a blank session.
+export SHIM_SESSION_DIR="${SHIM_SESSION_DIR:-/persona/kelivo-session}"
+if [ ! -d /persona ]; then
+  echo "[session] ERROR: /persona volume is missing; startup stopped"
+  exit 1
+fi
+node session-state.js --prepare || exit 1
+
 exec node server.js
