@@ -98,6 +98,30 @@ fi
 # Trust the workspace so CLAUDE.md loads cleanly (permissions come from --allowedTools).
 printf '%s' '{"hasCompletedOnboarding":true,"projects":{"/src":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true}}}' > "${HOME:-/root}/.claude.json"
 
+# 状态便签(look):启用时(设了 STATUS_WRITE_TOKEN)把 look MCP 条目写进 .mcp.json,
+# 指回 shim 自己的回环端点。照 mochi 清理的同款范式用 node 改 JSON,不抠文本。
+# 两份(/src 运行副本 + /persona 正本)都治,换容器后不丢。没启用则两份都摘掉,
+# 免得 claude 起来时对着一个 403 的端点报无关的连接错误。
+for mf in .mcp.json /persona/.mcp.json; do
+  [ -f "$mf" ] || continue
+  node -e '
+    const fs = require("fs"), p = process.argv[1];
+    const on = !!process.env.STATUS_WRITE_TOKEN;
+    const url = "http://127.0.0.1:" + (process.env.PORT || 8787) + "/mcp/look";
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    j.mcpServers = j.mcpServers || {};
+    const cur = j.mcpServers.look;
+    if (on && (!cur || cur.url !== url)) {
+      j.mcpServers.look = { type: "http", url };
+      fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+      console.log("[entrypoint] registered look MCP in " + p);
+    } else if (!on && cur) {
+      delete j.mcpServers.look;
+      fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+      console.log("[entrypoint] removed look MCP from " + p + " (STATUS_WRITE_TOKEN unset)");
+    }' "$mf" || true
+done
+
 # Native conversation storage must be prepared before any Claude subprocess.
 # The existing volume is required; a missing mount must never start a blank session.
 export SHIM_SESSION_DIR="${SHIM_SESSION_DIR:-/persona/kelivo-session}"

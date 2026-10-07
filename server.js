@@ -37,6 +37,8 @@ import {
 import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
 import { buildAuthEnv, authMode } from "./auth-env.js";
 import { SessionStore, requestKey } from "./session-state.js";
+import { writeStatus, validateText, DEFAULT_STATUS_FILE } from "./status.js";
+import { mountLookMcp } from "./status-mcp.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -109,8 +111,17 @@ function cliSupportsReplace() {
 // 省 token:--tools 只装真用的内置工具(Bash/Edit/Task 等大 schema 全砍,基线立减);
 // MCP 工具(ombre/fish/gmail)不受 --tools 影响,走 mcp-config 照常加载。
 const BUILTIN_TOOLS = process.env.BUILTIN_TOOLS ?? "WebSearch,WebFetch";
-const ALLOWED = process.env.ALLOWED_TOOLS ||
+// 状态便签(look):钥匙即开关(照 /report、/aw 的范式)。不设 STATUS_WRITE_TOKEN =
+// 写入口 503、look 端点不挂、.mcp.json 不加条目 —— 整套功能静默不存在。
+// 钥匙独立于 SHIM_KEY:这把要存进她手机的快捷指令里,泄露只影响这一个功能。
+const STATUS_WRITE_TOKEN = process.env.STATUS_WRITE_TOKEN || "";
+const STATUS_ON = !!STATUS_WRITE_TOKEN;
+const STATUS_FILE = process.env.STATUS_FILE || DEFAULT_STATUS_FILE;
+const ALLOWED0 = process.env.ALLOWED_TOOLS ||
   ["WebSearch", "WebFetch", "mcp__ombre", "mcp__fish", "mcp__gmail"].join(",");
+// look 启用时自动放进 allowedTools:别让「加了工具却在权限层被拦」成为一个坑。
+const ALLOWED = STATUS_ON && !ALLOWED0.split(",").some((t) => t.trim() === "mcp__look")
+  ? ALLOWED0 + ",mcp__look" : ALLOWED0;
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sessionReason = (e) => e.code ? "session_io_" + e.code
@@ -815,6 +826,7 @@ app.get("/debug", (_q, r) => r.json({
   report: { on: REPORT_ON, count: activity.length },
   // 健康数据中转:on=false 表示没配 AW_KEY = 这个口子整个关着(2026-09-05 起默认如此)
   aw: { on: AW_ON, count: awData.length },
+  status: { on: STATUS_ON },   // 便签:只报开没开,内容和时间都不报(私话)
   // 工作台:⚠️ 同样因为这个口子裸奔,只报开没开,不报地址、不报活儿内容(那些在工作台自己的 /jobs 里)
   hands: { on: handsReady(), callback: !!HANDS_CB_TOKEN },
   wake: {
@@ -1501,6 +1513,33 @@ async function tgPoll() {
   }
 }
 if (TG_TOKEN) tgPoll();
+
+// ---- 状态便签:她随手给他留一句近况 ------------------------------------------
+// 手机快捷指令 POST 一句话进来,只存最新一条;他用 look 工具读(status-mcp.js)。
+// 响应与日志都不回显正文 —— 这是她留给他的话,不是运维数据。
+if (STATUS_ON) {
+  app.post("/status", (req, res) => {
+    const bearer = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    if (bearer !== STATUS_WRITE_TOKEN) return res.status(401).json({ ok: false, error: "unauthorized" });
+    const v = validateText(req.body);
+    if (v.error) {
+      log("[status] 400", v.error, v.receivedShape ? "shape=" + v.receivedShape : "");
+      return res.status(400).json({ ok: false, error: v.error, ...(v.receivedShape ? { receivedShape: v.receivedShape } : {}) });
+    }
+    let rec;
+    try {
+      rec = writeStatus(STATUS_FILE, v.text);
+    } catch (e) {
+      log("[status] 写入失败:", e.message);
+      return res.status(500).json({ ok: false, error: "没存上(存储故障),这条没有生效" });
+    }
+    log("[status] 收到一条,", [...v.text].length, "字"); // 只记字数,不记内容
+    res.status(201).json({ ok: true, writtenAt: rec.writtenAt, timeZone: process.env.TZ || "UTC" });
+  });
+  mountLookMcp(app, { statusFile: STATUS_FILE, log });
+} else {
+  app.post("/status", (_q, res) => res.status(503).json({ ok: false, error: "status disabled (no STATUS_WRITE_TOKEN)" }));
+}
 
 // ---- Apple Watch 健康数据中转 --------------------------------------------------
 // 手机快捷指令 POST 任意 JSON 到 /aw?key=<AW_KEY>;AI 用 WebFetch GET 同一地址读。
