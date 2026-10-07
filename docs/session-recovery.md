@@ -74,7 +74,22 @@ when the active session fails.
 
 On a failed CLI result, wrong session ID, missing/invalid history, write failure
 or interrupted turn, the shim emits an explicit error and blocks automatic
-processing. A process failure never silently completes the HTTP turn. An idle
+processing, and sends one operator alert through the existing Telegram channel
+(outside the model's window) so a night-time lockout is noticed. A process
+failure never silently completes the HTTP turn.
+
+An impersonated empty round (successful result, empty text, zero output tokens)
+is handled separately: it has no confirmable assistant tail, so forcing it
+through the checkpoint path would lock the service up. Instead the shim resets
+to `pending` without advancing the checkpoint — the round is rolled back on the
+next recovery — deletes the round's request ID so the exact same message can be
+resent, rejects the turn with a resend hint, and sends a rate-limited operator
+notice. The dead-turn watcher keeps its own escalation cadence.
+
+Durable state is pruned every committed round: fallback history is trimmed to a
+recent tail (marking it incomplete, which disables only the fallback; native
+checkpoints remain the recovery path), and completed/uncertain request IDs
+expire after seven days. Reply text is not stored in the request table. An idle
 process exit waits for a new real message and resumes; it does not auto-spawn.
 Restarting after repair converts remaining inflight IDs to uncertain and restores
 only the last confirmed checkpoint. Unknown inputs are not replayed. External

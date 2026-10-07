@@ -139,13 +139,50 @@ function blockRecovery(reason) {
   log("[session] blocked:", reason);
   if (turn) {
     try { sessions?.fail(turn.key); } catch { log("[session] failed to save uncertain request"); }
-    rejectSink(turn.sse, "会话恢复或保存失败：" + reason + "。自动重试已暂停，请检查服务后再继续。");
+    rejectSink(turn.sse, "会话恢复或保存失败：" + reason + "。自动重试已暂停，请检查服务后再继续。" +
+      "修好后若要重发这条消息，请稍微改动措辞（加个字或标点即可）。");
     turn = null;
   }
   busy = false;
   for (const item of queue.splice(0)) rejectSink(item.sse, "会话未就绪，消息没有发送。请检查服务。");
   const old = proc; proc = null; nativeSessionId = null;
   old?.kill();
+  // 停机必须喊人(审查修补 2026-10-08):锁死最可能发生在没人看的时刻(半夜心跳轮、CLI 崩溃),
+  // 只拒掉当前轮等于让他哑到她自己发现为止。走运维通道直发,不进他的窗口。
+  // blockRecovery 开头的幂等判断保证这条只发一次,不会刷屏。
+  tgSend(
+    `🚨 会话保护触发停机(${reason})。为防错轮和重复回答,已暂停全部回复。\n` +
+    `请到 Zeabur 重启服务(Restart);重启后他会接回原来的窗口,记忆不丢。`
+  ).catch((e) => log("[tg-err]", e.message));
+}
+// 空转复位(非终态版):这一轮压根没跑起来 —— 正文空、零输出,就是 9-02 那种
+// 「代理把错误伪装成合法空响应」。和停机做同样的清场,但状态回到 pending:
+// 存档点没有推进,这一轮等于没发生过,下一条真实消息会照常恢复原窗口。
+// 当前轮的去重 key 一并删掉 —— 空转 = 她的话没被回答,原样重发必须能进来。
+let lastHaltNoticeAt = 0;
+function haltRound(reason) {
+  if (recovery.phase === "failed") return;
+  recovery.phase = "pending"; recovery.mode = null;
+  clearTimeout(recoveryTimer);
+  log("[session] halt round:", reason);
+  if (turn) {
+    try { sessions?.forget(turn.key); } catch { log("[session] failed to clear request id"); }
+    rejectSink(turn.sse, "这一轮没有跑起来(空响应),你刚才那条消息没有被回答 —— 原样重发一次就行。");
+    turn = null;
+  }
+  busy = false;
+  for (const item of queue.splice(0)) rejectSink(item.sse, "上一轮空转,这条消息没有发送,请重发。");
+  const old = proc; proc = null; nativeSessionId = null;
+  old?.kill();
+  // 轻量知会 + 30 分钟节流:偶发一次是线路抖,连续出现她该知道。连续空转的
+  // 升级报警仍由 deadWatch 按它自己的节奏负责,这里不抢它的活。
+  if (Date.now() - lastHaltNoticeAt > 30 * 60000) {
+    lastHaltNoticeAt = Date.now();
+    tgSend(
+      `⚠️ 刚才一轮空转(${reason}),已自动复位,窗口没有丢。` +
+      `偶发一次多半是线路抖动;反复出现的话,可能是凭据或代理出了问题。`
+    ).catch((e) => log("[tg-err]", e.message));
+  }
 }
 
 // replace 模式下锚点已并入正文,SOUL_ANCHOR 不再参与组装 —— 有人设了它却没生效是最难查的那种。
@@ -555,6 +592,13 @@ function handleEvent(ev) {
         tgSend(dead.text).catch((e) => log("[tg-err]", e.message));
       }
     }
+    // 空转轮不许走存档(审查修补 2026-10-08):没有产出的轮次不存在可确认的
+    // assistant 落盘,硬走 sessions.complete 只会等满重试然后把全服锁死 ——
+    // 9-02 那种伪装空响应会变成停机事故。空转改走温和复位:清场、存档点不动
+    // (这一轮视同没发生,恢复时自动回滚)、去重 key 删掉让她能原样重发。
+    if (sessionDir && !turn.fullText.trim() && !(ev.usage && ev.usage.output_tokens > 0)) {
+      return haltRound("cli_empty_round");
+    }
     // 窗口用量:用本轮各次请求里最大的那个真实前缀。
     // 不跨轮取 max —— 数值本身已经准确,跨轮钉死只会让某次异常永远修不回来
     // (上一版正是因为 Math.max + 顶层累加值,一次虚报就把 32% 永久显示成 97%)。
@@ -632,7 +676,7 @@ function enqueue(item) {
   if (recovery.phase === "failed") return rejectSink(item.sse, "会话未就绪：" + recovery.error);
   if ((item.kind || "user") !== "user" && !internalReady()) return rejectSink(item.sse, "会话恢复完成前，自动消息已暂停。");
   if (item.key && (sessions.entry(item.key) || queue.some((q) => q.key === item.key) || turn?.key === item.key)) {
-    return rejectSink(item.sse, "这条消息已提交过；为避免重复发送，本次请求已停止。", 409);
+    return rejectSink(item.sse, "这条消息刚才已经提交过,为避免重复回答,这次没有发送。确实想再发一遍的话,稍微改动一下措辞(加个字或标点)即可。", 409);
   }
   queue.push(item); pump();
 }

@@ -97,6 +97,24 @@ function findNative(projects, id, cwd) {
   return null;
 }
 
+// Bound durable growth so state.json cannot swell for months (it is rewritten and
+// fsynced every round). Trimming fallback history disables only the fallback —
+// native checkpoints remain the recovery path. Request IDs absorb retries, which
+// arrive within minutes or days, never months; inflight entries are never expired.
+export const HISTORY_MAX_CHARS = 150000;
+export const REQUEST_TTL_MS = 7 * 86400e3;
+export function pruneState(state, now = Date.now()) {
+  let size = 0, cut = 0;
+  for (let i = state.history.length - 1; i >= 0; i--) {
+    size += (state.history[i].user?.length || 0) + (state.history[i].assistant?.length || 0);
+    if (size > HISTORY_MAX_CHARS) { cut = i + 1; break; }
+  }
+  if (cut > 0) { state.history = state.history.slice(cut); state.historyComplete = false; }
+  for (const [k, r] of Object.entries(state.requests)) {
+    if (r.status !== "inflight" && now - (r.at || 0) > REQUEST_TTL_MS) delete state.requests[k];
+  }
+}
+
 export function requestKey(body, explicitId = "") {
   const messages = body.messages || [];
   let last = -1;
@@ -143,6 +161,12 @@ export class SessionStore {
   fail(key) {
     if (!this.enabled || !key) return;
     if (this.entry(key)) this.state.requests[key].status = "uncertain";
+    this.save();
+  }
+  forget(key) {
+    // A round that never ran produced no answer; its exact resend must be admitted.
+    if (!this.enabled || !key || !this.entry(key)) return;
+    delete this.state.requests[key];
     this.save();
   }
   reset() {
@@ -213,7 +237,10 @@ export class SessionStore {
     if (input !== undefined) this.state.history.push({ user: input, assistant: output, ...(images.length ? { images: true } : {}) });
     this.state.context = context; this.state.gate = gate;
     this.state.completedAt = Date.now();
-    if (key) this.state.requests[key] = { status: "completed", at: Date.now(), output, usage };
+    // Dedup needs only the ID and status; storing reply text would add one more
+    // private copy that nothing reads (duplicates are rejected, never replayed).
+    if (key) this.state.requests[key] = { status: "completed", at: Date.now() };
+    pruneState(this.state);
     this.save(); // Commit checkpoint + result before declaring the HTTP turn done.
     // Keep the current and one prior checkpoint; do not accumulate copies forever.
     for (const e of fs.readdirSync(this.dir)) {

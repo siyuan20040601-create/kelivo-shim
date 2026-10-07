@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { SessionStore, prepareProjects, requestKey } from "../session-state.js";
+import { SessionStore, prepareProjects, requestKey, pruneState } from "../session-state.js";
 const root = path.resolve(import.meta.dirname, "..");
 const pause = (ms = 20) => new Promise((r) => setTimeout(r, ms));
 const readLines = (f) => fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : [];
@@ -223,4 +223,34 @@ test("corrupt saved JSON produces an explicit code without logging private conte
     fs.writeFileSync(path.join(f.dir, "state.json"), '{"private":"sensitive-fragment" BROKEN}');
     assert.throws(() => new SessionStore({ dir: f.dir }), { message: "session_state_invalid_json" });
   } finally { fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
+test("an impersonated empty round resets instead of locking up; its exact resend is admitted and the window survives", async () => {
+  const f = setup(); let s;
+  try {
+    s = await start(f);
+    assert.equal(await answer(s, "remember:ember-442"), "ack:remember:ember-442");
+    const dead = await s.send("DEAD_NOW", "dead-1");
+    assert.equal(dead.status, 503);
+    assert.match((await dead.json()).error.message, /\u91cd\u53d1/); // tells her to resend
+    assert.equal((await s.health()).session.phase, "pending");    // reset, not failed
+    assert.equal((await s.health()).ok, true);                    // not an outage
+    assert.equal((await s.hb()).triggered, false);                // internal rounds stay gated
+    assert.equal(await answer(s, "recall", "dead-1"), "ember-442"); // same ID admitted; window intact
+    assert.equal(readLines(f.runs).at(-1).args.includes("--resume"), true);
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
+test("durable state is pruned: oversized fallback history is trimmed and stale request IDs expire", () => {
+  const state = { history: [], historyComplete: true, requests: {
+    old: { status: "completed", at: 1 },
+    fresh: { status: "completed", at: Date.now() },
+    stuck: { status: "inflight", at: 1 },
+  } };
+  for (let i = 0; i < 40; i++) state.history.push({ user: "u".repeat(5000), assistant: "a".repeat(5000) });
+  pruneState(state);
+  assert.ok(state.history.length > 0 && state.history.length < 40, "keeps only a recent tail");
+  assert.ok(JSON.stringify(state.history).length <= 200001, "bounded size");
+  assert.equal(state.historyComplete, false, "a trimmed history is no longer complete");
+  assert.deepEqual(Object.keys(state.requests).sort(), ["fresh", "stuck"], "expired completed IDs removed; inflight kept");
 });

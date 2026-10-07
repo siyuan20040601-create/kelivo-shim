@@ -30,6 +30,9 @@ rl.on("line", (line) => {
   if (!init) { init = true; emit({ type: "system", subtype: "init", session_id: id }); }
   append(row("user", input));
   if (text === "CRASH") { setTimeout(() => process.exit(2), 15); return; }
+  // Impersonated-empty round (the 2026-09-02 proxy failure): success result,
+  // zero output, no assistant row and no stream events.
+  if (text === "DEAD_NOW") { emit({ type: "result", subtype: "success", session_id: id, usage: { output_tokens: 0 } }); return; }
   const known = history.filter((r) => r.type === "user").map((r) => r.message.content).find((s) => typeof s === "string" && s.startsWith("remember:"));
   const output = text === "recall" ? (known?.slice(9) || "UNKNOWN") : "ack:" + text;
   setTimeout(() => {
