@@ -180,24 +180,24 @@ const PAGE_HTML = `<!doctype html>
     </section>
     <svg class="kitten" viewBox="0 0 230 150" aria-hidden="true">
       <!-- 蜷成一团睡着的奶白小猫(小汉堡) -->
-      <path d="M60 134 Q30 122 31 96 Q32 83 44 76" fill="none" stroke="#E3CBA0" stroke-width="14" stroke-linecap="round"/>
-      <ellipse cx="112" cy="100" rx="76" ry="41" fill="#F6EBD4" stroke="#C9A87C" stroke-width="3"/>
+      <path d="M60 134 Q30 122 31 96 Q32 83 44 76" fill="none" stroke="#98A2B4" stroke-width="14" stroke-linecap="round"/>
+      <ellipse cx="112" cy="100" rx="76" ry="41" fill="#AEB7C6" stroke="#7E8899" stroke-width="3"/>
       <path d="M58 112 Q96 92 92 70" fill="none" stroke="#E7D5AF" stroke-width="3" stroke-linecap="round"/>
-      <path d="M140 52 L148 27 L163 46 Z" fill="#F6EBD4" stroke="#C9A87C" stroke-width="3" stroke-linejoin="round"/>
-      <path d="M146 44 L150 33 L157 42 Z" fill="#EFB9AF"/>
-      <path d="M177 52 L189 29 L196 52 Z" fill="#F6EBD4" stroke="#C9A87C" stroke-width="3" stroke-linejoin="round"/>
-      <path d="M183 47 L188 37 L192 47 Z" fill="#EFB9AF"/>
-      <circle cx="166" cy="76" r="33" fill="#F6EBD4" stroke="#C9A87C" stroke-width="3"/>
-      <path d="M149 76 q6 6 12 0" fill="none" stroke="#8A6B4F" stroke-width="2.6" stroke-linecap="round"/>
-      <path d="M172 76 q6 6 12 0" fill="none" stroke="#8A6B4F" stroke-width="2.6" stroke-linecap="round"/>
-      <path d="M163 87 q4 4 8 0" fill="none" stroke="#C98A82" stroke-width="2.2" stroke-linecap="round"/>
-      <circle cx="145" cy="88" r="5.5" fill="#F2C4C4" opacity=".55"/>
-      <circle cx="189" cy="88" r="5.5" fill="#F2C4C4" opacity=".55"/>
-      <path d="M131 82 L116 79 M131 88 L117 89" stroke="#C9A87C" stroke-width="1.6" stroke-linecap="round"/>
-      <path d="M200 82 L214 79 M200 88 L213 89" stroke="#C9A87C" stroke-width="1.6" stroke-linecap="round"/>
-      <path d="M96 134 q9 -9 18 0 M122 136 q9 -9 18 0" fill="none" stroke="#C9A87C" stroke-width="3" stroke-linecap="round"/>
-      <text x="196" y="34" font-size="19" fill="#C9A87C" transform="rotate(-8 196 34)">z</text>
-      <text x="210" y="20" font-size="13" fill="#C9A87C" transform="rotate(-8 210 20)">z</text>
+      <path d="M140 52 L148 27 L163 46 Z" fill="#AEB7C6" stroke="#7E8899" stroke-width="3" stroke-linejoin="round"/>
+      <path d="M146 44 L150 33 L157 42 Z" fill="#D8A8B0"/>
+      <path d="M177 52 L189 29 L196 52 Z" fill="#AEB7C6" stroke="#7E8899" stroke-width="3" stroke-linejoin="round"/>
+      <path d="M183 47 L188 37 L192 47 Z" fill="#D8A8B0"/>
+      <circle cx="166" cy="76" r="33" fill="#AEB7C6" stroke="#7E8899" stroke-width="3"/>
+      <path d="M149 76 q6 6 12 0" fill="none" stroke="#5C6575" stroke-width="2.6" stroke-linecap="round"/>
+      <path d="M172 76 q6 6 12 0" fill="none" stroke="#5C6575" stroke-width="2.6" stroke-linecap="round"/>
+      <path d="M163 87 q4 4 8 0" fill="none" stroke="#A3808A" stroke-width="2.2" stroke-linecap="round"/>
+      <circle cx="145" cy="88" r="5.5" fill="#D8A8B0" opacity=".55"/>
+      <circle cx="189" cy="88" r="5.5" fill="#D8A8B0" opacity=".55"/>
+      <path d="M131 82 L116 79 M131 88 L117 89" stroke="#8E99AC" stroke-width="1.6" stroke-linecap="round"/>
+      <path d="M200 82 L214 79 M200 88 L213 89" stroke="#8E99AC" stroke-width="1.6" stroke-linecap="round"/>
+      <path d="M96 134 q9 -9 18 0 M122 136 q9 -9 18 0" fill="none" stroke="#7E8899" stroke-width="3" stroke-linecap="round"/>
+      <text x="196" y="34" font-size="19" fill="#8E99AC" transform="rotate(-8 196 34)">z</text>
+      <text x="210" y="20" font-size="13" fill="#8E99AC" transform="rotate(-8 210 20)">z</text>
     </svg>
   </main>
   <button type="button" class="keep" id="keep">收好纸条</button>

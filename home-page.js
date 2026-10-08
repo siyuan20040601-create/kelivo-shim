@@ -102,13 +102,13 @@ const HOUSE_SVG = `<svg class="house" viewBox="0 0 160 120" aria-hidden="true">
 </svg>`;
 
 const KITTEN_SVG = `<svg class="kitten" viewBox="0 0 230 150" aria-hidden="true"><g class="cat">
-  <path d="M60 134 Q30 122 31 96 Q32 83 44 76" fill="none" stroke="#C9A87C" stroke-width="14" stroke-linecap="round" opacity=".5"/>
-  <ellipse cx="112" cy="100" rx="76" ry="41" fill="#F6EBD4" stroke="#C9A87C" stroke-width="4"/>
-  <path d="M140 52 L148 27 L163 46 Z" fill="#F6EBD4" stroke="#C9A87C" stroke-width="4" stroke-linejoin="round"/>
-  <path d="M177 52 L189 29 L196 52 Z" fill="#F6EBD4" stroke="#C9A87C" stroke-width="4" stroke-linejoin="round"/>
-  <circle cx="166" cy="76" r="33" fill="#F6EBD4" stroke="#C9A87C" stroke-width="4"/>
-  <path d="M149 76 q6 6 12 0 M172 76 q6 6 12 0" fill="none" stroke="#8A6B4F" stroke-width="3" stroke-linecap="round"/>
-  <circle cx="145" cy="88" r="5.5" fill="#F2C4C4" opacity=".55"/><circle cx="189" cy="88" r="5.5" fill="#F2C4C4" opacity=".55"/>
+  <path d="M60 134 Q30 122 31 96 Q32 83 44 76" fill="none" stroke="#98A2B4" stroke-width="14" stroke-linecap="round" opacity=".5"/>
+  <ellipse cx="112" cy="100" rx="76" ry="41" fill="#AEB7C6" stroke="#7E8899" stroke-width="4"/>
+  <path d="M140 52 L148 27 L163 46 Z" fill="#AEB7C6" stroke="#7E8899" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M177 52 L189 29 L196 52 Z" fill="#AEB7C6" stroke="#7E8899" stroke-width="4" stroke-linejoin="round"/>
+  <circle cx="166" cy="76" r="33" fill="#AEB7C6" stroke="#7E8899" stroke-width="4"/>
+  <path d="M149 76 q6 6 12 0 M172 76 q6 6 12 0" fill="none" stroke="#5C6575" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="145" cy="88" r="5.5" fill="#D8A8B0" opacity=".55"/><circle cx="189" cy="88" r="5.5" fill="#D8A8B0" opacity=".55"/>
 </g></svg>`;
 
 function loginPage(msg = "") {
