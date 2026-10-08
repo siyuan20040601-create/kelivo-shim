@@ -72,6 +72,18 @@ function reply(text) {
     return;
   }
 
+  // HOLD_OK → 演 OB 新版归档:工具叫 hold,成功返回不带 🗄️(「新建 →id 标签」)。
+  // shim 注入的自动归档轮(新措辞「用你的记忆工具(hold)归档」)也走这条——
+  // 和线上一致:自动归档轮如今得到的是 hold 的返回,不是旧 archive_session 的。
+  if (text.includes("HOLD_OK") || (text.includes("用你的记忆工具") && !text.includes("ARCHIVE_FAIL"))) {
+    const id = "toolu_fake_hold";
+    out({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: "mcp__ombre__hold" } } });
+    out({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
+    out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: "新建 →be13fba4401b 恋爱,心理" }] } });
+    out({ type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "存好了" } } });
+    out({ type: "result", subtype: "success", usage: { output_tokens: 5 } });
+    return;
+  }
   const wantArchive = text.includes("archive_session");
   const wantFail = text.includes("ARCHIVE_FAIL");
   if (wantArchive || wantFail) {

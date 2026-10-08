@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   gateDecision, hookStdout, trimTranscript, renderReplay, GATE_REASON, DEFAULT_MAX_BLOCKS,
+  ARCHIVE_TOOLS, isArchiveSuccess,
 } from "../compact-gate.js";
 
 const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "compact-instructions.js");
@@ -172,4 +173,14 @@ test("钩子带上 SHIM_KEY,鉴权失败(401)也放行", async () => {
   );
   assert.equal(seenKey, "k123", "钩子要把 SHIM_KEY 带上");
   assert.equal(out.stdout, "只留一行");
+});
+
+test("归档成功判定:hold 的非报错返回算成功,报错不算,旧🗄️标记仍然认", () => {
+  assert.ok(ARCHIVE_TOOLS.has("hold") && ARCHIVE_TOOLS.has("archive_session"));
+  assert.ok(isArchiveSuccess({ text: "新建 →be13fba4401b 恋爱,心理" }));
+  assert.ok(isArchiveSuccess({ text: "🗄️ 已归档 会话归档 2026-08-02" }));
+  assert.ok(!isArchiveSuccess({ text: "归档失败: OB 连不上" }));
+  assert.ok(!isArchiveSuccess({ text: "summary 不能为空" }));
+  assert.ok(!isArchiveSuccess({ text: "新建 →abc", isError: true }), "is_error 一票否决");
+  assert.ok(!isArchiveSuccess({ text: "   " }), "空返回不算成功");
 });

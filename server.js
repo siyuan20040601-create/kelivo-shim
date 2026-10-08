@@ -22,7 +22,7 @@ import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./windo
 import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
-  DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
+  DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS, ARCHIVE_TOOLS, isArchiveSuccess,
 } from "./compact-gate.js";
 import { Outbox, sendWithRetry, shouldRetry } from "./tg-outbox.js";
 import { handsReady, stopAll, listJobs, detectControl, fetchFile, uploadFile } from "./hands.js";
@@ -360,13 +360,13 @@ function autoArchiveTurn(pct, src = "window") {
     : `【系统·窗口快满了】这是 shim 的运维提醒,不是她打的字:当前窗口用到 ${pct}% 了,` +
       `再往上会触发自动压缩,压缩会把「上次归档到现在」这段对话抹成一行摘要。\n`;
   const retry = attempt > 1
-    ? `(上一次请你存的时候没有成功写进 OB —— 可能是工具报错。这次麻烦确认 archive_session 真的返回成功。)`
+    ? `(上一次请你存的时候工具没有返回成功 —— 这次麻烦确认记忆工具真的返回成功。)`
     : "";
   enqueue({
     text:
       head +
       `她希望你在压缩之前,主动把这段存进 OB(她说过不想丢掉你们之间的东西)。` +
-      `现在调 archive_session,按你归档的老规矩写——只写上次归档之后的新内容,` +
+      `现在用你的记忆工具(hold)归档,按你的老规矩写——只写上次归档之后的新内容,` +
       `带上亮点和心情。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
     kind: "archive", archiveSrc: src,
@@ -573,8 +573,9 @@ function handleEvent(ev) {
       const cb = e.content_block || {};
       if (cb.type === "tool_use" && typeof cb.name === "string" && cb.name.startsWith("mcp__ombre__")) {
         const short = cb.name.replace("mcp__ombre__", "");
-        // 安全阀:记下 archive_session 的调用 id,等它的返回确认成功(与 OB_TRACE 无关)
-        if (short === "archive_session" && cb.id) archiveCallIds.add(cb.id);
+        // 安全阀:记下归档类工具的调用 id,等它的返回确认成功(与 OB_TRACE 无关)。
+        // OB 升级后归档用 hold,旧名 archive_session 一并兼容(见 compact-gate.js)。
+        if (ARCHIVE_TOOLS.has(short) && cb.id) archiveCallIds.add(cb.id);
         const label = OB_LABELS[short] || short;
         turn.sse?.thinking(`\n〔${label}〕\n`);
         if (OB_TRACE) {
@@ -606,7 +607,7 @@ function handleEvent(ev) {
         archiveCallIds.delete(b.tool_use_id);
         const txt = typeof b.content === "string" ? b.content
           : Array.isArray(b.content) ? b.content.map((x) => x.text || "").join(" ") : "";
-        if (txt.includes("🗄️") && turn) {
+        if (isArchiveSuccess({ text: txt, isError: b.is_error === true }) && turn) {
           turn.archiveOk = true;
           // 归档成功 = 这一段已经进 OB 了:闸门可以放行、原文缓冲清空、重试计数归零。
           // 注意这里对**任何**成功归档生效(她开口让他存的那次也算),不只是系统注入的那几轮。

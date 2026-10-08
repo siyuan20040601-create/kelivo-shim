@@ -69,5 +69,8 @@ export function lookupPrompt(summary, { bjNow, userName = "她" } = {}) {
 // 系统注入的轮次里,他选择不出声的判定。与心跳轮共用同一套约定(人设里写的就是【沉默】)。
 export function isSilentReply(t) {
   const s = (t || "").trim();
-  return !s || s.includes("【沉默】");
+  // 裸"沉默"也算(9-30 与 10-08 两次实证:他时常不带括号,整条消息就俩字,
+  // 被当正常发言推到她手机上刷屏)。只认整条消息即是"沉默"(允许跟标点),
+  // 普通句子里包含"沉默"二字的不算。
+  return !s || s.includes("【沉默】") || /^沉默[。．.!！…~～\s]*$/.test(s);
 }

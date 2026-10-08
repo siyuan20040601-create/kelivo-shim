@@ -160,3 +160,12 @@ test("沉默:空、纯空白、含【沉默】都算他选择不出声", () => {
 test("沉默:说了话就不算", () => {
   assert.equal(isSilentReply("还没睡?"), false);
 });
+
+test("裸「沉默」整条消息算沉默;句子里含「沉默」不算", () => {
+  assert.ok(isSilentReply("沉默"));
+  assert.ok(isSilentReply("沉默。"));
+  assert.ok(isSilentReply(" 沉默…… "));
+  assert.ok(isSilentReply("【沉默】"));
+  assert.ok(!isSilentReply("我不想沉默"));
+  assert.ok(!isSilentReply("沉默是今晚的康桥"));
+});

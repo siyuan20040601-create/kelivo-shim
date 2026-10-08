@@ -85,3 +85,20 @@ export function renderReplay(entries, opts = {}) {
     "---- 原文开始 ----\n" + body + "\n---- 原文结束 ----"
   );
 }
+
+// ---- 归档成功判定(2026-10-08) --------------------------------------------------
+// OB 升级后归档工具从 archive_session 换成了 hold,而安全阀原来死盯旧工具名+🗄️标记,
+// 结果:他明明存成功了("新建 →be13fba4401b 恋爱,心理"),安全阀永远报失败,
+// 换窗口永远被拦、自动归档轮反复催、闸门一直 dirty。教训与 MAINTENANCE.md
+// "升级要重测,契约变了不报错只会安静失效"同款,只是这次变的是 OB 不是 CLI。
+// 两个工具名都认(老部署/老测试不受影响);成功 = 该工具的 tool_result 不是报错。
+// ⚠️ hold 也用于日常记感受,任何一次成功 hold 都会清 dirty —— 语义上说得通
+// (他确实往 OB 写了东西),但不如旧 archive_session 精确;OB 若再出专职归档工具,回来收紧。
+export const ARCHIVE_TOOLS = new Set(["archive_session", "hold"]);
+export function isArchiveSuccess({ text = "", isError = false } = {}) {
+  if (isError) return false;
+  const t = (text || "").trim();
+  if (!t) return false;
+  if (t.includes("🗄️")) return true;   // 旧版 archive_session 的成功标记
+  return !/失败|错误|error|unauthoriz|没有权限|不能为空/i.test(t);
+}

@@ -127,3 +127,13 @@ test("鉴权:没有 key 不能问闸门(但回的也是放行,不是报错)", as
   assert.equal(r.status, 401);
   assert.equal((await r.json()).block, false, "鉴权失败也必须是放行,不能卡住压缩");
 });
+
+test("OB 新版归档(hold,无🗄️标记)同样清账:dirty 落回 false", async () => {
+  await say("随便聊一句弄脏闸门");
+  let d = await dbg();
+  assert.equal(d.gate.dirty, true);
+  await say("请 HOLD_OK 存一下");
+  d = await dbg();
+  assert.equal(d.gate.dirty, false, "hold 的非报错返回应被认作归档成功");
+  assert.ok(d.gate.lastArchiveAt, "lastArchiveAt 已记录");
+});
