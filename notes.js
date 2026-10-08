@@ -151,11 +151,15 @@ export function renderCard(n, { expanded = false } = {}) {
     : `${head}\n<i>${tgEsc(n.preview)}</i>\n<i>${bj(n.created_at)}</i>`;
 }
 
-export function keyboard(n, { expanded = false } = {}) {
+export function keyboard(n, { expanded = false, appUrl = "" } = {}) {
   const heart = n.liked_at ? "❤️ 已喜欢" : "🤍 喜欢";
+  // 配了 Mini App 地址(NOTE_APP_URL)→「拆开纸条」打开信纸页(note-app.js);
+  // 没配 → 维持原地展开。展开/收起只存在于没配的旧路径里。
+  const open = appUrl
+    ? { text: "拆开纸条", web_app: { url: `${appUrl}/note-app?id=${n.note_id}` } }
+    : { text: "拆开纸条", callback_data: `note:open:${n.note_id}` };
   const rows = [
-    [expanded ? { text: "收起", callback_data: `note:fold:${n.note_id}` }
-              : { text: "拆开纸条", callback_data: `note:open:${n.note_id}` }],
+    [expanded ? { text: "收起", callback_data: `note:fold:${n.note_id}` } : open],
     [{ text: heart, callback_data: `note:like:${n.note_id}` }],
   ];
   if (!n.replied_at) rows[1].push({ text: "✍️ 回信", callback_data: `note:reply:${n.note_id}` });

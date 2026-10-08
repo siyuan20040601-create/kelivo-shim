@@ -40,6 +40,7 @@ import { SessionStore, requestKey } from "./session-state.js";
 import { writeStatus, validateText, DEFAULT_STATUS_FILE } from "./status.js";
 import { mountLookMcp } from "./status-mcp.js";
 import { NoteStore, renderCard, keyboard, parseCallback, replyEventText, DEFAULT_NOTES_FILE } from "./notes.js";
+import { mountNoteApp } from "./note-app.js";
 import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
 import { mountWindowAdmin } from "./window-admin.js";
 
@@ -878,7 +879,7 @@ app.get("/debug", (_q, r) => r.json({
   // 健康数据中转:on=false 表示没配 AW_KEY = 这个口子整个关着(2026-09-05 起默认如此)
   aw: { on: AW_ON, count: awData.length },
   status: { on: STATUS_ON },   // 便签:只报开没开,内容和时间都不报(私话)
-  notes: { count: noteStore.count(), undelivered: noteStore.undeliveredCount() }, // 小纸条:只报条数
+  notes: { count: noteStore.count(), undelivered: noteStore.undeliveredCount(), app: !!NOTE_APP_URL }, // 小纸条:只报条数与信纸页开关
   // 工作台:⚠️ 同样因为这个口子裸奔,只报开没开,不报地址、不报活儿内容(那些在工作台自己的 /jobs 里)
   hands: { on: handsReady(), callback: !!HANDS_CB_TOKEN },
   wake: {
@@ -1625,13 +1626,31 @@ if (STATUS_ON) {
 // 拆开/点赞 = 安静事件,随下一轮捎带;回信 = 立即进同一条队列并唤醒(见 submitTurn 与下方)。
 const noteStore = new NoteStore(process.env.NOTES_FILE || DEFAULT_NOTES_FILE, log);
 
+// 信纸页(Telegram Mini App,note-app.js):配了 NOTE_APP_URL 才启用,值就是本服务的
+// 公网地址(https://…zeabur.app)。TG 硬性要求 web_app 按钮是 https,不合格直接忽略,
+// 免得整条 sendMessage 被拒、纸条发不出去。不配 = 一切如旧(聊天里原地展开)。
+const NOTE_APP_URL = (() => {
+  const u = (process.env.NOTE_APP_URL || "").trim().replace(/\/+$/, "");
+  if (u && !/^https:\/\//i.test(u)) { log("[note-app] NOTE_APP_URL 必须是 https 地址,已忽略:", u); return ""; }
+  return u;
+})();
+const noteKb = (n, opts = {}) => keyboard(n, { appUrl: NOTE_APP_URL, ...opts });
+if (NOTE_APP_URL && TG_TOKEN) {
+  mountNoteApp(app, {
+    store: noteStore, botToken: TG_TOKEN, getChatId: () => tgChatId, log,
+    // 她在信纸页点爱心 → 聊天里卡片的 ❤️ 按钮也跟着变(同一份状态;刷新失败无所谓)
+    onLiked: (n) => { if (n?.chat_id && n?.message_id) tgApi("editMessageReplyMarkup", {
+      chat_id: n.chat_id, message_id: n.message_id, reply_markup: noteKb(n) }).catch(() => {}); },
+  });
+}
+
 // 他调 leave_note → 建纸条 + 发 TG 卡片。返回给他看的一句结果。
 async function sendNote(title, content) {
   if (!String(content || "").trim()) return "纸条正文是空的,没有发出。";
   if (!tgChatId) return "Telegram 还没就绪(她还没跟机器人说过话),纸条存下了但没能发出。";
   const n = noteStore.create({ title, content });
   const j = await tgApi("sendMessage", {
-    chat_id: tgChatId, text: renderCard(n), parse_mode: "HTML", reply_markup: keyboard(n),
+    chat_id: tgChatId, text: renderCard(n), parse_mode: "HTML", reply_markup: noteKb(n),
   });
   if (!j.ok) throw new Error("Telegram 拒收: " + JSON.stringify(j).slice(0, 120));
   noteStore.bindMessage(n.note_id, tgChatId, j.result.message_id);
@@ -1653,7 +1672,7 @@ async function handleNoteCallback(cq) {
       await tgApi("editMessageText", {
         chat_id: n.chat_id, message_id: n.message_id,
         text: renderCard(n, { expanded: parsed.action === "open" }), parse_mode: "HTML",
-        reply_markup: keyboard(n, { expanded: parsed.action === "open" }),
+        reply_markup: noteKb(n, { expanded: parsed.action === "open" }),
       });
       return ack();
     }
@@ -1662,7 +1681,7 @@ async function handleNoteCallback(cq) {
       const expanded = !!n.opened_at && !(cq.message.text || "").includes(n.preview);
       await tgApi("editMessageReplyMarkup", {
         chat_id: n.chat_id, message_id: n.message_id,
-        reply_markup: keyboard(n, { expanded }),
+        reply_markup: noteKb(n, { expanded }),
       });
       return ack(r.liked ? "❤️" : "已取消");
     }
@@ -1695,7 +1714,7 @@ async function handleNoteReply(m) {
   // 更新卡片按钮(去掉回信钮),失败无所谓
   tgApi("editMessageReplyMarkup", {
     chat_id: n.chat_id, message_id: n.message_id,
-    reply_markup: keyboard(n, { expanded: !!n.opened_at }),
+    reply_markup: noteKb(n, { expanded: !!n.opened_at }),
   }).catch(() => {});
   const sink = {
     text() {}, thinking(t) { /* 回信轮的思考不单独发,正文走 finish */ },
