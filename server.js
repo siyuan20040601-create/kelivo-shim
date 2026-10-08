@@ -39,6 +39,7 @@ import { buildAuthEnv, authMode } from "./auth-env.js";
 import { SessionStore, requestKey } from "./session-state.js";
 import { writeStatus, validateText, DEFAULT_STATUS_FILE } from "./status.js";
 import { mountLookMcp } from "./status-mcp.js";
+import { NoteStore, renderCard, keyboard, parseCallback, replyEventText, DEFAULT_NOTES_FILE } from "./notes.js";
 import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
 import { mountWindowAdmin } from "./window-admin.js";
 
@@ -877,6 +878,7 @@ app.get("/debug", (_q, r) => r.json({
   // 健康数据中转:on=false 表示没配 AW_KEY = 这个口子整个关着(2026-09-05 起默认如此)
   aw: { on: AW_ON, count: awData.length },
   status: { on: STATUS_ON },   // 便签:只报开没开,内容和时间都不报(私话)
+  notes: { count: noteStore.count(), undelivered: noteStore.undeliveredCount() }, // 小纸条:只报条数
   // 工作台:⚠️ 同样因为这个口子裸奔,只报开没开,不报地址、不报活儿内容(那些在工作台自己的 /jobs 里)
   hands: { on: handsReady(), callback: !!HANDS_CB_TOKEN },
   wake: {
@@ -1493,6 +1495,7 @@ async function handleTgMessage(m) {
   if (!tgChatId) { tgChatId = m.chat.id; log("[tg] chat locked:", tgChatId); }
   else if (m.chat.id !== tgChatId) return; // 单用户:只认锁定的那个人
   let text = (m.text || m.caption || "").trim();
+  if (await handleNoteReply(m)) return;       // 纸条回信:存档后进原队列唤醒他,不当普通消息重复处理
   if (await stickerIntake(m, text)) return;   // 收集模式:给刚发的贴纸起个名,不进他的窗口
   if (await handsControl(text)) return;       // 急停 / 看活儿:不进他的窗口,也不排 busy 队列
   const images = [];
@@ -1576,7 +1579,8 @@ async function tgPoll() {
       const j = await r.json();
       if (j.ok) for (const u of j.result) {
         tgOffset = u.update_id + 1;
-        if (u.message) await handleTgMessage(u.message);
+        if (u.callback_query) await handleNoteCallback(u.callback_query);
+        else if (u.message) await handleTgMessage(u.message);
       }
     } catch (e) {
       // 拉取失败不丢消息:offset 没推进,Telegram 会在下次成功时把它们补给我们。
@@ -1611,9 +1615,100 @@ if (STATUS_ON) {
     log("[status] 收到一条,", [...v.text].length, "字"); // 只记字数,不记内容
     res.status(201).json({ ok: true, writtenAt: rec.writtenAt, timeZone: process.env.TZ || "UTC" });
   });
-  mountLookMcp(app, { statusFile: STATUS_FILE, log });
+  mountLookMcp(app, { statusFile: STATUS_FILE, log, onNote: TG_TOKEN ? sendNote : null });
 } else {
   app.post("/status", (_q, res) => res.status(503).json({ ok: false, error: "status disabled (no STATUS_WRITE_TOKEN)" }));
+}
+
+// ---- 小纸条:他留折叠卡片,她拆开/点爱心/回信 ----------------------------------
+// 来自交接邮件《Telegram「小纸条」通用实现思路》基础版。存储与渲染在 notes.js。
+// 拆开/点赞 = 安静事件,随下一轮捎带;回信 = 立即进同一条队列并唤醒(见 submitTurn 与下方)。
+const noteStore = new NoteStore(process.env.NOTES_FILE || DEFAULT_NOTES_FILE, log);
+
+// 他调 leave_note → 建纸条 + 发 TG 卡片。返回给他看的一句结果。
+async function sendNote(title, content) {
+  if (!String(content || "").trim()) return "纸条正文是空的,没有发出。";
+  if (!tgChatId) return "Telegram 还没就绪(她还没跟机器人说过话),纸条存下了但没能发出。";
+  const n = noteStore.create({ title, content });
+  const j = await tgApi("sendMessage", {
+    chat_id: tgChatId, text: renderCard(n), reply_markup: keyboard(n),
+  });
+  if (!j.ok) throw new Error("Telegram 拒收: " + JSON.stringify(j).slice(0, 120));
+  noteStore.bindMessage(n.note_id, tgChatId, j.result.message_id);
+  log("[note] 纸条已送出", n.note_id);
+  return `纸条「${n.title}」已经作为折叠卡片放进她的 Telegram 了。她拆开或点赞你不会立刻知道;她回信会马上送来。`;
+}
+
+// 按钮回调。永远 answerCallbackQuery(邮件 §10:别让 TG 一直转圈)。
+async function handleNoteCallback(cq) {
+  const ack = (text) => tgApi("answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text } : {}) }).catch(() => {});
+  try {
+    const parsed = parseCallback(cq.data);
+    const chatOk = cq.message?.chat?.id === tgChatId && cq.from?.id === tgChatId;
+    const n = parsed && noteStore.get(parsed.id);
+    // 身份与归属校验(邮件 §5):不是她/纸条不在,只回一句,不执行。
+    if (!parsed || !chatOk || !n || n.message_id !== cq.message?.message_id) return ack("这张纸条不在了");
+    if (parsed.action === "open" || parsed.action === "fold") {
+      if (parsed.action === "open") noteStore.markOpened(n.note_id); // 幂等:只记第一次
+      await tgApi("editMessageText", {
+        chat_id: n.chat_id, message_id: n.message_id,
+        text: renderCard(n, { expanded: parsed.action === "open" }),
+        reply_markup: keyboard(n, { expanded: parsed.action === "open" }),
+      });
+      return ack();
+    }
+    if (parsed.action === "like") {
+      const r = noteStore.toggleLike(n.note_id);
+      const expanded = !!n.opened_at && !(cq.message.text || "").includes(n.preview);
+      await tgApi("editMessageReplyMarkup", {
+        chat_id: n.chat_id, message_id: n.message_id,
+        reply_markup: keyboard(n, { expanded }),
+      });
+      return ack(r.liked ? "❤️" : "已取消");
+    }
+    if (parsed.action === "reply") {
+      if (n.replied_at) return ack("这张纸条已经回过信啦");
+      const j = await tgApi("sendMessage", {
+        chat_id: tgChatId,
+        text: `回信给纸条「${n.title}」—— 直接回复本条消息把话写给他。`,
+        reply_markup: { force_reply: true, input_field_placeholder: "写给他的回信…" },
+      });
+      if (j.ok) noteStore.rememberReplyPrompt(n.note_id, j.result.message_id);
+      return ack();
+    }
+  } catch (e) {
+    log("[note-cb-err]", e.message);
+    return ack("出了点小岔子,再点一次试试");
+  }
+}
+
+// 她对 ForceReply 的回复 → 这是纸条回信:存档、确认、立即进原队列唤醒他(邮件 §8)。
+// 返回 true = 已按回信处理,调用方不再把它当普通聊天消息。
+async function handleNoteReply(m) {
+  const promptId = m.reply_to_message?.message_id;
+  if (!promptId) return false;
+  const n = noteStore.findByReplyPrompt(promptId);
+  if (!n) return false;
+  const r = noteStore.setReply(n.note_id, m.text || "");
+  if (r.error === "empty") { await tgSend("回信是空的,没送出去 —— 再回复一次那条提示写点什么吧。"); return true; }
+  if (r.error === "already") { await tgSend("这张纸条已经回过信啦。"); return true; }
+  if (r.error) return false;
+  // 更新卡片按钮(去掉回信钮),失败无所谓
+  tgApi("editMessageReplyMarkup", {
+    chat_id: n.chat_id, message_id: n.message_id,
+    reply_markup: keyboard(n, { expanded: !!n.opened_at }),
+  }).catch(() => {});
+  const sink = {
+    text() {}, thinking(t) { /* 回信轮的思考不单独发,正文走 finish */ },
+    error(message) { tgSend("[shim] " + message).catch((e) => log("[tg-err]", e.message)); },
+    finish(_u, fullText) {
+      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      if (t) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+    },
+  };
+  // 走 submitTurn:同一条串行队列、算她出现(这确实是她在说话)、带时间戳与去重。
+  submitTurn(replyEventText(n), [], sink, { src: "note-reply", key: requestKey({}, `tg-note:${n.note_id}`) });
+  return true;
 }
 
 // ---- Apple Watch 健康数据中转 --------------------------------------------------
@@ -1895,6 +1990,9 @@ function submitTurn(text, images, sink, opts = {}) {
   const reset = images.length ? null : detectReset(text);
   // 只有 switch 才重启窗口;archive/无 都不重启。归档动作交给沈渡自己按约定完成。
   const newWindow = reset === "switch";
+  // 纸条的安静事件(拆开/点赞)随这一轮捎给他(邮件 §7:不打断,下次自然得知)
+  const quiet = noteStore.quietLines();
+  if (quiet.length) { text = `(${quiet.join(";")})\n${text}`; noteStore.markQuietDelivered(); }
   // 时间戳在意图识别之后注入,否则"归档/晚安"这类短词会被时间戳前缀顶掉认不出
   if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
   lastUserAt = Date.now(); // 自主时间空闲计时基准
