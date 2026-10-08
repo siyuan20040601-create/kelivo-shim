@@ -135,6 +135,9 @@ export class NoteStore {
     if (changed) this.save();
   }
   count() { return Object.keys(this.notes).length; }
+  unopenedCount() {
+    return Object.values(this.notes).filter((n) => !n.opened_at).length;
+  }
   undeliveredCount() {
     return Object.values(this.notes).reduce((s, n) => s + n.undelivered.length, 0);
   }

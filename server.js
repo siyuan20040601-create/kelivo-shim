@@ -41,6 +41,7 @@ import { writeStatus, validateText, DEFAULT_STATUS_FILE } from "./status.js";
 import { mountLookMcp } from "./status-mcp.js";
 import { NoteStore, renderCard, keyboard, parseCallback, replyEventText, DEFAULT_NOTES_FILE } from "./notes.js";
 import { mountNoteApp } from "./note-app.js";
+import { mountHomePage } from "./home-page.js";
 import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
 import { mountWindowAdmin } from "./window-admin.js";
 
@@ -923,6 +924,27 @@ function adminSnapshot() {
 }
 if (SHIM_KEY) mountWindowAdmin(app, { key: SHIM_KEY, snapshot: adminSnapshot, log });
 else log("[admin] SHIM_KEY 未设置,/admin/window 不挂载");
+
+// 家门口 /home(home-page.js):「欢迎回家,安安」+ 各房间的真实灯火。
+// 与管理页同一把钥匙、同一套只读纪律;快照里只有元数据,没有任何正文。
+function homeSnapshot() {
+  const a = adminSnapshot();
+  let statusWrittenAt = null, statusBroken = false;
+  if (STATUS_ON) {
+    try {
+      const rec = JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
+      if (rec && rec.writtenAt) statusWrittenAt = rec.writtenAt; else statusBroken = true;
+    } catch (e) { if (e.code !== "ENOENT") statusBroken = true; }
+  }
+  return {
+    tokens: a.tokens, limit: a.limit, busy: a.busy, queued: a.queued,
+    lastSpokeAt, lastTurnAt,
+    wakeDay: `${WAKE_DAY_START}–${WAKE_DAY_END}`, wakeIdleMinDay: WAKE_IDLE_MIN_DAY,
+    notesCount: noteStore.count(), notesUnopened: noteStore.unopenedCount(),
+    statusOn: STATUS_ON, statusWrittenAt, statusBroken,
+  };
+}
+if (SHIM_KEY) mountHomePage(app, { key: SHIM_KEY, snapshot: homeSnapshot, log });
 
 // 压缩闸门:PreCompact 钩子在压缩发生前问这里「能压吗」。
 // 钩子和 shim 在同一个容器里(claude 是 shim 的子进程),所以走 127.0.0.1,鉴权沿用 SHIM_KEY。
