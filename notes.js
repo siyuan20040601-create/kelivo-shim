@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID, randomBytes } from "node:crypto";
+import { tgEsc } from "./tg-chunk.js";
 
 export const DEFAULT_NOTES_FILE = "/persona/notes/notes.json";
 const TTL_MS = 60 * 86400e3;      // 纸条留 60 天(TG 清聊天不会通知服务器,所以要 TTL)
@@ -100,6 +101,10 @@ export class NoteStore {
   findByReplyPrompt(messageId) {
     return Object.values(this.notes).find((n) => n.reply_prompt_mid === messageId) || null;
   }
+  // 她直接(左滑)回复卡片本身 → 也是回信。只认还没回过信的卡片。
+  findByCardMessage(messageId) {
+    return Object.values(this.notes).find((n) => n.message_id === messageId) || null;
+  }
   // 回信:每张纸条只收一封(唯一约束),重复提交返回 already。
   setReply(id, text) {
     const n = this.get(id); if (!n) return { error: "notfound" };
@@ -136,12 +141,14 @@ export class NoteStore {
 }
 
 // ---- TG 卡片渲染与按钮 ---------------------------------------------------------
+// HTML 富文本(粗体标题/斜体预览/引用正文),所有动态内容严格转义(邮件 §10)。
 const bj = (t) => new Date(t + 8 * 3600e3).toISOString().slice(5, 16).replace("T", " ");
 
 export function renderCard(n, { expanded = false } = {}) {
+  const head = `💌 <b>${tgEsc(n.title)}</b>`;
   return expanded
-    ? `📝 ${n.title}\n${bj(n.created_at)}\n\n${n.content}`
-    : `📝 ${n.title}\n${bj(n.created_at)} · ${n.preview}`;
+    ? `${head}\n\n<blockquote>${tgEsc(n.content)}</blockquote>\n<i>${bj(n.created_at)}${n.liked_at ? " · ❤️" : ""}</i>`
+    : `${head}\n<i>${tgEsc(n.preview)}</i>\n<i>${bj(n.created_at)}</i>`;
 }
 
 export function keyboard(n, { expanded = false } = {}) {

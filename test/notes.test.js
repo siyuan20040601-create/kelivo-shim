@@ -93,3 +93,15 @@ test("MCP 工具表:注入 onNote 后多出 leave_note;调用走注入的发送�
   assert.equal(fail.result.isError, false, "失败也走文字告知,不抛协议错误");
   assert.match(fail.result.content[0].text, /没送出去/);
 });
+
+test("左滑回复卡片本身也算回信;HTML 注入被转义", () => {
+  const s = new NoteStore(path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notes-")), "n.json"));
+  const n = s.create({ title: "x<b>y", content: "正文<script>片段,足够长足够长足够长足够长足够长足够长" });
+  s.bindMessage(n.note_id, 111, 2222);
+  assert.equal(s.findByCardMessage(2222).note_id, n.note_id);
+  assert.equal(s.findByCardMessage(3333), null);
+  const html = renderCard(s.get(n.note_id), { expanded: true });
+  assert.ok(!html.includes("<script>"), "正文里的标签被转义");
+  assert.ok(html.includes("&lt;script&gt;"));
+  assert.ok(html.includes("<b>x&lt;b&gt;y</b>"), "标题加粗且内容转义");
+});

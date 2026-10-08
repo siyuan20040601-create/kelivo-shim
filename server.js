@@ -1631,7 +1631,7 @@ async function sendNote(title, content) {
   if (!tgChatId) return "Telegram 还没就绪(她还没跟机器人说过话),纸条存下了但没能发出。";
   const n = noteStore.create({ title, content });
   const j = await tgApi("sendMessage", {
-    chat_id: tgChatId, text: renderCard(n), reply_markup: keyboard(n),
+    chat_id: tgChatId, text: renderCard(n), parse_mode: "HTML", reply_markup: keyboard(n),
   });
   if (!j.ok) throw new Error("Telegram 拒收: " + JSON.stringify(j).slice(0, 120));
   noteStore.bindMessage(n.note_id, tgChatId, j.result.message_id);
@@ -1652,7 +1652,7 @@ async function handleNoteCallback(cq) {
       if (parsed.action === "open") noteStore.markOpened(n.note_id); // 幂等:只记第一次
       await tgApi("editMessageText", {
         chat_id: n.chat_id, message_id: n.message_id,
-        text: renderCard(n, { expanded: parsed.action === "open" }),
+        text: renderCard(n, { expanded: parsed.action === "open" }), parse_mode: "HTML",
         reply_markup: keyboard(n, { expanded: parsed.action === "open" }),
       });
       return ack();
@@ -1668,13 +1668,11 @@ async function handleNoteCallback(cq) {
     }
     if (parsed.action === "reply") {
       if (n.replied_at) return ack("这张纸条已经回过信啦");
-      const j = await tgApi("sendMessage", {
-        chat_id: tgChatId,
-        text: `回信给纸条「${n.title}」—— 直接回复本条消息把话写给他。`,
-        reply_markup: { force_reply: true, input_field_placeholder: "写给他的回信…" },
-      });
-      if (j.ok) noteStore.rememberReplyPrompt(n.note_id, j.result.message_id);
-      return ack();
+      // 不再发机器人腔的提示消息:直接教她左滑回复卡片本身(回信路由见 handleNoteReply)。
+      return tgApi("answerCallbackQuery", {
+        callback_query_id: cq.id, show_alert: true,
+        text: "左滑这张纸条直接回复,写下的话就会递到他手里。",
+      }).catch(() => {});
     }
   } catch (e) {
     log("[note-cb-err]", e.message);
@@ -1687,8 +1685,9 @@ async function handleNoteCallback(cq) {
 async function handleNoteReply(m) {
   const promptId = m.reply_to_message?.message_id;
   if (!promptId) return false;
-  const n = noteStore.findByReplyPrompt(promptId);
+  const n = noteStore.findByReplyPrompt(promptId) || noteStore.findByCardMessage(promptId);
   if (!n) return false;
+  if (n.replied_at) { await tgSend("这张纸条已经回过信啦。"); return true; }
   const r = noteStore.setReply(n.note_id, m.text || "");
   if (r.error === "empty") { await tgSend("回信是空的,没送出去 —— 再回复一次那条提示写点什么吧。"); return true; }
   if (r.error === "already") { await tgSend("这张纸条已经回过信啦。"); return true; }
