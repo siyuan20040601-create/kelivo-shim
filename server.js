@@ -42,6 +42,7 @@ import { mountLookMcp } from "./status-mcp.js";
 import { NoteStore, renderCard, keyboard, parseCallback, replyEventText, DEFAULT_NOTES_FILE } from "./notes.js";
 import { mountNoteApp } from "./note-app.js";
 import { mountHomePage } from "./home-page.js";
+import { guardSpeech } from "./speech-guard.js";
 import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
 import { mountWindowAdmin } from "./window-admin.js";
 
@@ -1310,6 +1311,12 @@ async function tgSendSticker(name) {
 // 心跳、主动开口这些没有触发消息的场合不传,回应会自己降级成气泡(见下)。
 async function tgSendReply(text, { replyTo = 0 } = {}) {
   if (!tgChatId || !(text || "").trim()) return;
+  // 台词守门员(speech-guard.js):模型把 user/system/think 这些后台道具当台词说出去时,
+  // 在这里没收 —— 2026-10-08 晚哥哥线三连走神的教训。只记日志,不发告警,不回显内容。
+  const guarded = guardSpeech(text);
+  if (guarded.cut) log("[guard] 没收了一段后台道具,放行", guarded.text.length, "字");
+  text = guarded.text;
+  if (!text.trim()) return;
   const segs = [];
   for (const s of splitVoiceSegments(text)) {
     if (s.type !== "text") { segs.push(s); continue; }
