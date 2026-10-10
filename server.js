@@ -15,7 +15,7 @@ import fs from "fs";
 import path from "path";
 import { spawn, execFileSync } from "child_process";
 import { randomUUID } from "crypto";
-import { splitVoiceSegments, ttsOgg } from "./voice.js";
+import { splitVoiceSegments, ttsOgg, sttText, simpleEarLine } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { splitReactionSegments, canonicalReaction } from "./reactions.js";
 import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
@@ -926,7 +926,7 @@ app.get("/debug", (_q, r) => r.json({
     lastCollisionAt: lastCollisionAt ? new Date(lastCollisionAt).toISOString() : null,
   },
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
-  ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
+  ears: { ready: earsReady(), auth: !!EARS_TOKEN, mode: earsReady() ? "full" : (EL_KEY ? "simple" : "off") },   // full=字+语气;simple=只转字;off=聋
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
@@ -1483,6 +1483,7 @@ async function tgFetchSticker(m) {
 // 结果贴在这条消息上一起进窗口。ears 没配或挂了都只是少一层信息,消息本身不丢。
 const EARS_URL = (process.env.EARS_URL || "").replace(/\/+$/, "");
 const EARS_TOKEN = process.env.EARS_TOKEN || "";
+const EARS_STT_MODEL = process.env.EARS_STT_MODEL || "scribe_v1"; // 简版耳朵的转写模型
 const earsReady = () => !!EARS_URL;
 
 // 她发来的文件(document)。⚠️ Telegram 的 bot 下载上限是 20MB,超了 getFile 直接失败,
@@ -1608,13 +1609,17 @@ async function handleTgMessage(m) {
   if (m.voice || m.audio) {
     // 转写要几秒,先让她看到「正在听」而不是干等
     tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+    // 耳朵分两档:完整版(EARS_URL,字+语气+声音基线)优先;没盖那栋楼时,
+    // 简版用 TTS 同一把 ElevenLabs 钥匙转写,只出字(2026-10-10「先弄简单版」)。
+    // 完整版一上线自动接管,这里不用再动。
     let note;
-    if (!earsReady()) note = "(她发来一条语音——耳朵还没接上,我听不到内容)";
+    if (!earsReady() && !EL_KEY) note = "(她发来一条语音——耳朵还没接上,我听不到内容)";
     else {
       try {
         const ogg = await tgFetchVoice(m);
-        note = ogg ? voiceLine(await earsListen(ogg))
-                   : "(她发来一条语音,但没能取到音频)";
+        if (!ogg) note = "(她发来一条语音,但没能取到音频)";
+        else if (earsReady()) note = voiceLine(await earsListen(ogg));
+        else note = simpleEarLine(await sttText({ ogg, apiKey: EL_KEY, modelId: EARS_STT_MODEL }));
       } catch (e) {
         log("[ears-err]", e.message);
         note = "(她发来一条语音,但这次没听清)";   // 降级:宁可少信息,不丢消息

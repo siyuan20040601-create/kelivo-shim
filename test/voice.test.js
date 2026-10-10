@@ -66,3 +66,11 @@ test("中文语音段照样出声(2026-10-10 拆闸):不再因 CJK 退回文字"
   assert.equal(mix[0].type, "voice");
   assert.equal(mix[1].content, "尾注");
 });
+
+test("简版耳朵:转写有字 → [语音] 行;空转写 → 诚实说没听清", async () => {
+  const { simpleEarLine } = await import("../voice.js");
+  assert.equal(simpleEarLine({ text: " 哥哥,晚安。 " }), "[语音] 哥哥,晚安。");
+  assert.equal(simpleEarLine({ text: "" }), "(她发来一条语音,但没听清内容)");
+  assert.equal(simpleEarLine({}), "(她发来一条语音,但没听清内容)");
+  assert.equal(simpleEarLine(), "(她发来一条语音,但没听清内容)");
+});

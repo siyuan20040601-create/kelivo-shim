@@ -72,3 +72,26 @@ function mp3ToOgg(mp3) {
     ff.stdin.end(mp3);
   });
 }
+
+// ---- 简版耳朵(2026-10-10,安安:「先弄简单版」)---------------------------------
+// 她在 TG 发语音,他至少要听懂**说了什么**。完整版「耳朵」(转写+语气+声音基线)
+// 是栋单独的小楼(EARS_URL),还没盖;在那之前,用同一把 ElevenLabs 钥匙走官方
+// 转写接口,只出文字,不出语气。模型名可换(scribe_v1 下架就换下一代),不必改代码。
+export async function sttText({ ogg, apiKey, modelId = "scribe_v1" }) {
+  const fd = new FormData();
+  fd.append("file", new Blob([ogg], { type: "audio/ogg" }), "voice.ogg");
+  fd.append("model_id", modelId);
+  const r = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+    method: "POST", headers: { "xi-api-key": apiKey }, body: fd,
+    signal: AbortSignal.timeout(45000),
+  });
+  if (!r.ok) throw new Error(`elevenlabs stt ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();   // { text, language_code, ... }
+}
+
+// 转写结果 → 给他看的一行。与完整版 voiceLine 同款口径([语音] 开头),
+// 以后换成完整耳朵时他那边的体感不变,只是多出语气括号。
+export function simpleEarLine(j = {}) {
+  const said = (j.text || "").trim();
+  return said ? `[语音] ${said}` : "(她发来一条语音,但没听清内容)";
+}
