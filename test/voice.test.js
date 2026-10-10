@@ -57,3 +57,12 @@ test("语音内容里的换行保留(交给 TTS 当停顿素材)", () => {
   const segs = splitVoiceSegments("[语音]Line one.\nLine two.[/语音]");
   assert.deepEqual(segs, [{ type: "voice", content: "Line one.\nLine two." }]);
 });
+
+test("中文语音段照样出声(2026-10-10 拆闸):不再因 CJK 退回文字", () => {
+  const segs = splitVoiceSegments("[语音]安安,我在。坐我旁边。[/语音]");
+  assert.deepEqual(segs, [{ type: "voice", content: "安安,我在。坐我旁边。" }]);
+  // 中英混写也是一段语音
+  const mix = splitVoiceSegments("【语音】安安,come here。【/语音】尾注");
+  assert.equal(mix[0].type, "voice");
+  assert.equal(mix[1].content, "尾注");
+});
