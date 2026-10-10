@@ -42,6 +42,7 @@ import { writeStatus, validateText, DEFAULT_STATUS_FILE } from "./status.js";
 import { mountLookMcp } from "./status-mcp.js";
 import { NoteStore, renderCard, keyboard, parseCallback, replyEventText, DEFAULT_NOTES_FILE } from "./notes.js";
 import { mountNoteApp } from "./note-app.js";
+import { mountFuyanInbox } from "./fuyan-inbox.js";
 import { mountHomePage } from "./home-page.js";
 import { guardSpeech } from "./speech-guard.js";
 import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
@@ -943,6 +944,7 @@ app.get("/debug", (_q, r) => r.json({
   aw: { on: AW_ON, count: awData.length },
   status: { on: STATUS_ON },   // 便签:只报开没开,内容和时间都不报(私话)
   notes: { count: noteStore.count(), undelivered: noteStore.undeliveredCount(), app: !!NOTE_APP_URL }, // 小纸条:只报条数与信纸页开关
+  fuyan: { count: fuyanInbox.list().length, unread: fuyanInbox.unread() }, // 傅言的信箱:只报条数
   // 工作台:⚠️ 同样因为这个口子裸奔,只报开没开,不报地址、不报活儿内容(那些在工作台自己的 /jobs 里)
   hands: { on: handsReady(), callback: !!HANDS_CB_TOKEN },
   wake: {
@@ -1007,6 +1009,12 @@ function homeSnapshot() {
   };
 }
 if (SHIM_KEY) mountHomePage(app, { key: SHIM_KEY, snapshot: homeSnapshot, log });
+
+// 傅言的信箱(fuyan-inbox.js):她用 iOS 快捷指令投小纸条(文字/语音/照片),
+// 傅言下次来先拆信。钥匙独立可配(FUYAN_KEY,只管信箱),缺省沿用 SHIM_KEY;
+// 两个都没配 → 信箱四个口整体 404,不裸奔。钥匙只能英文数字(HTTP 头装不下中文)。
+const FUYAN_KEY = process.env.FUYAN_KEY || SHIM_KEY;
+const fuyanInbox = mountFuyanInbox(app, { key: FUYAN_KEY, log });
 
 // 压缩闸门:PreCompact 钩子在压缩发生前问这里「能压吗」。
 // 钩子和 shim 在同一个容器里(claude 是 shim 的子进程),所以走 127.0.0.1,鉴权沿用 SHIM_KEY。
