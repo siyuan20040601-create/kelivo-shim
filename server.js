@@ -43,6 +43,7 @@ import { mountLookMcp } from "./status-mcp.js";
 import { NoteStore, renderCard, keyboard, parseCallback, replyEventText, DEFAULT_NOTES_FILE } from "./notes.js";
 import { mountNoteApp } from "./note-app.js";
 import { mountFuyanInbox } from "./fuyan-inbox.js";
+import { mountFuyanWrite } from "./fuyan-write.js";
 import { mountHomePage } from "./home-page.js";
 import { guardSpeech } from "./speech-guard.js";
 import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
@@ -1015,6 +1016,8 @@ if (SHIM_KEY) mountHomePage(app, { key: SHIM_KEY, snapshot: homeSnapshot, log })
 // 两个都没配 → 信箱四个口整体 404,不裸奔。钥匙只能英文数字(HTTP 头装不下中文)。
 const FUYAN_KEY = process.env.FUYAN_KEY || SHIM_KEY;
 const fuyanInbox = mountFuyanInbox(app, { key: FUYAN_KEY, log });
+// 投递页 /fuyan/write(fuyan-write.js):她手机主屏幕的「给傅言留言」入口,cookie 门锁,同一只信箱。
+mountFuyanWrite(app, { key: FUYAN_KEY, inbox: fuyanInbox, log });
 
 // 压缩闸门:PreCompact 钩子在压缩发生前问这里「能压吗」。
 // 钩子和 shim 在同一个容器里(claude 是 shim 的子进程),所以走 127.0.0.1,鉴权沿用 SHIM_KEY。

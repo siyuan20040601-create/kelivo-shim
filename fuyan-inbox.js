@@ -32,6 +32,7 @@ const EXT = {
   "image/webp": "webp", "image/gif": "gif",
   "audio/m4a": "m4a", "audio/x-m4a": "m4a", "audio/mp4": "m4a", "audio/aac": "m4a",
   "audio/mpeg": "mp3", "audio/ogg": "ogg", "audio/wav": "wav", "audio/x-wav": "wav",
+  "audio/webm": "webm",
 };
 const MIME = Object.entries(EXT).reduce((m, [k, v]) => (m[v] ??= k, m), {});
 export const extOf = (mime) => EXT[(mime || "").split(";")[0].trim().toLowerCase()] || null;
