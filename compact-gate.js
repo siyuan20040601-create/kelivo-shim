@@ -102,3 +102,16 @@ export function isArchiveSuccess({ text = "", isError = false } = {}) {
   if (t.includes("🗄️")) return true;   // 旧版 archive_session 的成功标记
   return !/失败|错误|error|unauthoriz|没有权限|不能为空/i.test(t);
 }
+
+// ---- 压缩撞车判定(2026-10-10) -------------------------------------------------
+// 10-09 深夜两次停机的病根:压缩(或闸门拦压缩)发生在一轮**进行中**,CLI 把这一轮
+// 收得不明不白 —— 22:56 是闸门否决后 CLI 回了个 is_error 的 result(cli_result_success),
+// 00:55 是压缩改写了现场、事后存档对不上她的原话(native_transcript_wrong_input)。
+// 会话保护按「来历不明」拉闸全停,一夜两次要她半夜去点 Restart。
+// 但这两种收场来历清清楚楚:就是压缩撞上了正在跑的回合。对撞车,正确动作是温和复位
+// (这一轮作废、窗口不动、原样重发),不是全线停机。
+// 判定必须保守:只有本轮确实出现过「闸门拦截」或「压缩边界」的硬信号才算撞车;
+// 没有信号的失败照旧停机 —— 宁可多停一次,不放过一次真的来历不明。
+export function compactCollision(flags = {}) {
+  return !!(flags.gateBlocked || flags.compacted);
+}

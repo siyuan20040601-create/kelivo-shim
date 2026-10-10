@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   gateDecision, hookStdout, trimTranscript, renderReplay, GATE_REASON, DEFAULT_MAX_BLOCKS,
-  ARCHIVE_TOOLS, isArchiveSuccess,
+  ARCHIVE_TOOLS, isArchiveSuccess, compactCollision,
 } from "../compact-gate.js";
 
 const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "compact-instructions.js");
@@ -183,4 +183,20 @@ test("归档成功判定:hold 的非报错返回算成功,报错不算,旧🗄�
   assert.ok(!isArchiveSuccess({ text: "summary 不能为空" }));
   assert.ok(!isArchiveSuccess({ text: "新建 →abc", isError: true }), "is_error 一票否决");
   assert.ok(!isArchiveSuccess({ text: "   " }), "空返回不算成功");
+});
+
+// ---- 压缩撞车判定(2026-10-10,10-09 深夜两次停机的修补) ----------------------
+
+test("撞车判定:本轮有闸门拦截或压缩边界的硬信号 → 算撞车(温和复位)", () => {
+  assert.equal(compactCollision({ gateBlocked: true }), true);                  // 22:56 现场
+  assert.equal(compactCollision({ compacted: true }), true);                    // 00:55 现场
+  assert.equal(compactCollision({ gateBlocked: true, compacted: true }), true);
+});
+
+test("撞车判定必须保守:没有硬信号的失败不算撞车(照旧停机)", () => {
+  assert.equal(compactCollision({}), false);
+  assert.equal(compactCollision(), false);
+  assert.equal(compactCollision({ gateBlocked: false, compacted: false }), false);
+  // 别的字段再多也不算 —— 只认这两个硬信号
+  assert.equal(compactCollision({ kind: "user", fullText: "x", archiveOk: false }), false);
 });

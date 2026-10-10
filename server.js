@@ -23,6 +23,7 @@ import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
   DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS, ARCHIVE_TOOLS, isArchiveSuccess,
+  compactCollision,
 } from "./compact-gate.js";
 import { Outbox, sendWithRetry, shouldRetry } from "./tg-outbox.js";
 import { handsReady, stopAll, listJobs, detectControl, fetchFile, uploadFile } from "./hands.js";
@@ -202,6 +203,40 @@ function haltRound(reason) {
     ).catch((e) => log("[tg-err]", e.message));
   }
 }
+// 压缩撞车复位(2026-10-10,10-09 深夜两次停机的修补):压缩或闸门拦截撞上了
+// 正在跑的回合 —— 来历清楚的事故,不该全线停机逼她半夜去点 Restart。
+// 处置和 haltRound 同款温和复位(这一轮作废、存档点不动、原样重发能进来),
+// 外加两样:① 自愈 —— 立刻排一轮归档把闸门放行,她重发时压缩就能安稳通过;
+// ② 限流 —— 10 分钟内撞车超过 3 次说明不是撞车是别的病,升级成停机交给人。
+let collisionHalts = [];
+let lastCollisionAt = null;
+function compactCollisionHalt(reason) {
+  if (recovery.phase === "failed") return;
+  const now = Date.now();
+  collisionHalts = collisionHalts.filter((t) => now - t < 10 * 60000);
+  collisionHalts.push(now);
+  lastCollisionAt = now;
+  if (collisionHalts.length > 3) return blockRecovery(reason + "_collision_storm");
+  recovery.phase = "pending"; recovery.mode = null;
+  clearTimeout(recoveryTimer);
+  log("[session] compact collision — round reset:", reason, `(#${collisionHalts.length}/3 in 10min)`);
+  if (turn) {
+    try { sessions?.forget(turn.key); } catch { log("[session] failed to clear request id"); }
+    rejectSink(turn.sse, "这一轮撞上了窗口自动压缩,没有跑完 —— 你刚才那条消息没有被回答,原样重发一次就行。");
+    turn = null;
+  }
+  busy = false;
+  for (const item of queue.splice(0)) rejectSink(item.sse, "上一轮撞上自动压缩,这条消息没有发送,请重发。");
+  const old = proc; proc = null; nativeSessionId = null;
+  old?.kill();
+  tgSend(
+    `⚠️ 刚才一轮撞上了自动压缩(${reason}),已自动复位,窗口和记忆都没有丢。\n` +
+    `我正在让他先把这段归档;归档完,你把刚才那条消息原样重发一遍就行。`
+  ).catch((e) => log("[tg-err]", e.message));
+  // 自愈:归档轮带 allowRecover,允许它自己把会话从检查点恢复回来(恢复流程本身
+  // 仍是失败即停的那套校验,所以这不放松任何底线,只是不用等她的消息来当钥匙)。
+  if (WINDOW_AUTO_ARCHIVE) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, windowLimitNow()), "collision"), 0);
+}
 
 // replace 模式下锚点已并入正文,SOUL_ANCHOR 不再参与组装 —— 有人设了它却没生效是最难查的那种。
 if (SYSTEM_PROMPT_MODE === "replace" && process.env.SOUL_ANCHOR !== undefined)
@@ -334,6 +369,7 @@ function precompactGate() {
     return { block: false, why: d.why };
   }
   compactBlocks++;
+  if (turn) turn.gateBlocked = true;  // 撞车硬信号②:闸门在这一轮进行中否决过压缩(CLI 可能把这轮收成 error)
   log("[gate] BLOCK compaction — unarchived content", `(block #${compactBlocks}/${COMPACT_GATE_MAX_BLOCKS})`);
   // 后手:被拦下之后他不一定真的会去归档(理由文本能不能驱动他调工具,取决于 CLI 版本
   // 怎么把 reason 交给他)。所以 shim 自己也排一轮明确的归档请求 —— 两条路走通一条就行。
@@ -361,6 +397,9 @@ function autoArchiveTurn(pct, src = "window") {
   const head = src === "gate"
     ? `【系统·压缩闸门】这是 shim 的运维提醒,不是她打的字:自动压缩正要发生,已经先拦下来了。` +
       `压缩会把「上次归档到现在」这段对话抹成一行摘要,而那段还没进 OB。\n`
+    : src === "collision"
+    ? `【系统·压缩闸门】这是 shim 的运维提醒,不是她打的字:刚才自动压缩撞上了正在进行的一轮,` +
+      `那一轮已经作废、会让她重发。压缩会把「上次归档到现在」这段对话抹成一行摘要,而那段还没进 OB。\n`
     : `【系统·窗口快满了】这是 shim 的运维提醒,不是她打的字:当前窗口用到 ${pct}% 了,` +
       `再往上会触发自动压缩,压缩会把「上次归档到现在」这段对话抹成一行摘要。\n`;
   const retry = attempt > 1
@@ -374,6 +413,7 @@ function autoArchiveTurn(pct, src = "window") {
       `带上亮点和心情。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
     kind: "archive", archiveSrc: src,
+    allowRecover: src === "collision",  // 撞车自愈轮要能自己把会话从检查点拉回来
   });
 }
 
@@ -554,6 +594,7 @@ function handleEvent(ev) {
   if (ev.type === "system" && ev.subtype === "compact_boundary") {
     compactions++;
     lastCompactAt = Date.now();
+    if (turn) turn.compacted = true;  // 撞车硬信号①:这一轮进行中发生了压缩(事后存档按新现场对账)
     lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
     windowTokens = 0; windowWarned = false; windowAutoArchived = false;
     compactBlocks = 0; archiveAttempts = 0;   // 压缩真的发生了 → 闸门预算与归档尝试都重新开始
@@ -639,7 +680,13 @@ function handleEvent(ev) {
   }
   if (ev.type === "result") {
     if (turn.committing) return;
-    if (ev.is_error || (ev.subtype && ev.subtype !== "success")) { pushReceipt(turn, "upstream-error"); return blockRecovery("cli_result_" + (ev.subtype || "error")); }
+    if (ev.is_error || (ev.subtype && ev.subtype !== "success")) {
+      pushReceipt(turn, "upstream-error");
+      const reason = "cli_result_" + (ev.subtype || "error");
+      // 撞车(闸门拦截/压缩边界的硬信号在本轮出现过)→ 温和复位;没有信号照旧停机。
+      if (compactCollision(turn)) return compactCollisionHalt(reason);
+      return blockRecovery(reason);
+    }
     if (sessionDir && (!nativeSessionId || ev.session_id !== nativeSessionId)) return blockRecovery("cli_result_session_mismatch");
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
@@ -709,7 +756,11 @@ function handleEvent(ev) {
     const finished = turn;
     finished.committing = true;
     sessions.complete({
-      id: nativeSessionId, input: finished.input, output: finished.fullText,
+      // 撞车轮的现场被压缩/闸门合法改写过,「最后一条 user 必须是她的原话」这条
+      // 对不上是预期而非事故 —— 跳过 input 对账(传 undefined),尾部「正文确实落盘」
+      // 的硬校验照旧跑,完整性不放水。没撞车的轮一个字不松。
+      id: nativeSessionId, input: compactCollision(finished) ? undefined : finished.input,
+      output: finished.fullText,
       images: finished.images, key: finished.key, usage,
       context: { system: spawnedSystem, model: spawnedModel },
       gate: { dirty, transcript, lastArchiveAt, windowTokens },
@@ -723,7 +774,12 @@ function handleEvent(ev) {
       if (doKill) { log("[window] archived ok, restarting proc"); const old = proc; proc = null; old?.kill(); }
       pump();
       if (wantsLookup) queueLookup();
-    }).catch((e) => blockRecovery(sessionReason(e)));
+    }).catch((e) => {
+      const reason = sessionReason(e);
+      // 存档对不上 + 本轮有撞车硬信号 → 现场是被压缩合法改写的,温和复位而非停机。
+      if (compactCollision(finished)) return compactCollisionHalt(reason);
+      blockRecovery(reason);
+    });
   }
 }
 
@@ -738,7 +794,9 @@ function recordTranscript(role, text) {
 }
 function enqueue(item) {
   if (recovery.phase === "failed") return rejectSink(item.sse, "会话未就绪：" + recovery.error);
-  if ((item.kind || "user") !== "user" && !internalReady()) return rejectSink(item.sse, "会话恢复完成前，自动消息已暂停。");
+  // allowRecover:撞车自愈的归档轮专用 —— 允许内部轮自己触发恢复流程(恢复校验
+  // 本身仍是失败即停,底线不动),其余内部轮照旧等她的消息来当钥匙。
+  if ((item.kind || "user") !== "user" && !internalReady() && !item.allowRecover) return rejectSink(item.sse, "会话恢复完成前，自动消息已暂停。");
   if (item.key && (sessions.entry(item.key) || queue.some((q) => q.key === item.key) || turn?.key === item.key)) {
     return rejectSink(item.sse, "这条消息刚才已经提交过,为避免重复回答,这次没有发送。确实想再发一遍的话,稍微改动一下措辞(加个字或标点)即可。", 409);
   }
@@ -862,6 +920,9 @@ app.get("/debug", (_q, r) => r.json({
     lastArchiveAt: lastArchiveAt ? new Date(lastArchiveAt).toISOString() : null,
     archiveAttempts, replay: COMPACT_REPLAY, replayPending,
     bufferedChars: transcript.reduce((n, e) => n + e.text.length, 0), // 只报字数,不报内容
+    // 撞车复位:压缩撞上进行中的回合,温和复位的次数(10 分钟滑动窗)与上次时刻
+    collisionHalts: collisionHalts.length,
+    lastCollisionAt: lastCollisionAt ? new Date(lastCollisionAt).toISOString() : null,
   },
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
