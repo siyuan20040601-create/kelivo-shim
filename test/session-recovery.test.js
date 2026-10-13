@@ -241,6 +241,24 @@ test("an impersonated empty round resets instead of locking up; its exact resend
   } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
 });
 
+test("SDK success+is_error is recoverable, reports the API reason, and preserves the confirmed window", async () => {
+  const f = setup(); let s;
+  try {
+    s = await start(f);
+    assert.equal(await answer(s, "remember:cedar-551"), "ack:remember:cedar-551");
+    const failed = await s.send("API_ERROR_NOW", "api-error-1");
+    assert.equal(failed.status, 503);
+    assert.match((await failed.json()).error.message, /mock upstream rate limit/);
+    assert.equal((await s.health()).session.phase, "pending");
+    assert.equal((await s.health()).ok, true);
+    assert.equal(await answer(s, "recall", "api-error-1"), "cedar-551", "同一请求 ID 可重发且旧窗口未丢");
+    assert.equal(readLines(f.runs).at(-1).args.includes("--resume"), true);
+    const state = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    const checkpoint = fs.readFileSync(path.join(f.dir, state.checkpoint), "utf8");
+    assert.equal(checkpoint.includes("API_ERROR_NOW"), false, "失败轮不得进入确认存档点");
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
 test("durable state is pruned: oversized fallback history is trimmed and stale request IDs expire", () => {
   const state = { history: [], historyComplete: true, requests: {
     old: { status: "completed", at: 1 },

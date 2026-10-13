@@ -104,12 +104,30 @@ test("看页面纯只读:刷新多次不产生任何模型轮次;回执真实反
   } finally { await s.stop(); fs.rmSync(s.temp, { recursive: true, force: true }); }
 });
 
-test("残留 1M 配置被夹回 200k 公式线(交接邮件必测 §5)", async () => {
-  const s = await startShim({ WINDOW_LIMIT: "1000000" });
+test("1M 模型在 CLI 实报前使用 967k 公式线", async () => {
+  const s = await startShim({ BRAIN_MODEL: "claude-opus-5-5" });
   try {
     const dbg = await (await fetch(s.base + "/debug")).json();
-    assert.equal(dbg.window.configuredLimit, 1000000);
-    assert.equal(dbg.window.limit, 167000, "CLI 未确认扩展上下文前,按 167k 监控");
+    assert.equal(dbg.window.configuredLimit, 967000);
+    assert.equal(dbg.window.limit, 967000, "CLI 未实报前,按 1M 模型公式监控");
+  } finally { await s.stop(); fs.rmSync(s.temp, { recursive: true, force: true }); }
+});
+
+test("显式 WINDOW_LIMIT 覆盖不再被旧 167k 规则夹回", async () => {
+  const s = await startShim({ WINDOW_LIMIT: "967000" });
+  try {
+    const dbg = await (await fetch(s.base + "/debug")).json();
+    assert.equal(dbg.window.configuredLimit, 967000);
+    assert.equal(dbg.window.limit, 967000);
+  } finally { await s.stop(); fs.rmSync(s.temp, { recursive: true, force: true }); }
+});
+
+test("1M 模型自动迁移线上残留的旧默认 167k 配置", async () => {
+  const s = await startShim({ BRAIN_MODEL: "claude-opus-5-5", WINDOW_LIMIT: "167000" });
+  try {
+    const dbg = await (await fetch(s.base + "/debug")).json();
+    assert.equal(dbg.window.configuredLimit, 967000);
+    assert.equal(dbg.window.limit, 967000);
   } finally { await s.stop(); fs.rmSync(s.temp, { recursive: true, force: true }); }
 });
 

@@ -8,7 +8,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert";
-import { prefixFromMessageStart, prefixOf, windowPct, DEFAULT_WINDOW_LIMIT } from "../window.js";
+import {
+  prefixFromMessageStart, prefixOf, windowPct,
+  DEFAULT_WINDOW_LIMIT, EXTENDED_WINDOW_LIMIT, windowLimitForModel,
+} from "../window.js";
 
 const msgStart = (u) => ({ type: "message_start", message: { usage: u } });
 
@@ -65,4 +68,11 @@ test("limit 为 0 不除零", () => {
 test("默认触发线与 Claude Code 的算法对得上(200k 上下文)", () => {
   // effectiveWindow = 200000 - min(maxOutput, 20000);  threshold = effectiveWindow - 13000
   assert.equal(DEFAULT_WINDOW_LIMIT, 200000 - 20000 - 13000);
+});
+
+test("claude-opus-5-5 按 1M 上下文计算 967k 压缩线", () => {
+  assert.equal(EXTENDED_WINDOW_LIMIT, 1000000 - 20000 - 13000);
+  assert.equal(windowLimitForModel("claude-opus-5-5"), 967000);
+  assert.equal(windowLimitForModel("claude-opus-5-5-20261001"), 967000);
+  assert.equal(windowLimitForModel("claude-opus-4-6"), 167000);
 });

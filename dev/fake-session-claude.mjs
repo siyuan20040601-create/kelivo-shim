@@ -33,6 +33,13 @@ rl.on("line", (line) => {
   // Impersonated-empty round (the 2026-09-02 proxy failure): success result,
   // zero output, no assistant row and no stream events.
   if (text === "DEAD_NOW") { emit({ type: "result", subtype: "success", session_id: id, usage: { output_tokens: 0 } }); return; }
+  // Agent SDK 的 SDKResultSuccess 可以同时 is_error=true；这是单轮 API 错误，
+  // 不是 native 会话损坏。生产 shim 必须回滚本轮并允许原样重发。
+  if (text === "API_ERROR_NOW") {
+    emit({ type: "result", subtype: "success", is_error: true, api_error_status: 429,
+      result: "mock upstream rate limit", session_id: id, usage: { output_tokens: 0 } });
+    return;
+  }
   const known = history.filter((r) => r.type === "user").map((r) => r.message.content).find((s) => typeof s === "string" && s.startsWith("remember:"));
   const output = text === "recall" ? (known?.slice(9) || "UNKNOWN") : "ack:" + text;
   setTimeout(() => {

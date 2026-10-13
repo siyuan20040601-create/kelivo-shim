@@ -7,8 +7,16 @@
 //   effectiveWindow = 模型上下文上限 - min(最大输出 token, 20000)
 //   threshold       = effectiveWindow - 13000(压缩缓冲)
 // 200k 上下文的模型 → 200000 - 20000 - 13000 = 167000。
-// 换模型/上限变了就用环境变量 WINDOW_LIMIT 覆盖。
+// 1M 上下文的模型   → 1000000 - 20000 - 13000 = 967000。
+// 换模型/上限变了会先按模型选线；环境变量 WINDOW_LIMIT 仍可显式覆盖。
 export const DEFAULT_WINDOW_LIMIT = 167000;
+export const EXTENDED_WINDOW_LIMIT = 967000;
+
+export function windowLimitForModel(model = "") {
+  return /^claude-opus-5-5(?:-|$)/i.test(String(model))
+    ? EXTENDED_WINDOW_LIMIT
+    : DEFAULT_WINDOW_LIMIT;
+}
 
 // 一次 API 请求的「前缀大小」= 这次请求实际送进去的上下文。
 export const prefixOf = (u) =>

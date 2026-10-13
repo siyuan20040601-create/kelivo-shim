@@ -18,7 +18,7 @@ import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg, sttText, simpleEarLine } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { splitReactionSegments, canonicalReaction } from "./reactions.js";
-import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import { prefixFromMessageStart, windowPct, windowLimitForModel, DEFAULT_WINDOW_LIMIT } from "./window.js";
 import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
@@ -181,29 +181,54 @@ function blockRecovery(reason) {
 // 存档点没有推进,这一轮等于没发生过,下一条真实消息会照常恢复原窗口。
 // 当前轮的去重 key 一并删掉 —— 空转 = 她的话没被回答,原样重发必须能进来。
 let lastHaltNoticeAt = 0;
-function haltRound(reason) {
+function resetRound(reason, {
+  currentMessage,
+  queuedMessage,
+  notice,
+} = {}) {
   if (recovery.phase === "failed") return;
-  recovery.phase = "pending"; recovery.mode = null;
+  recovery.phase = sessionDir ? "pending" : "disabled"; recovery.mode = null; recovery.error = null;
   clearTimeout(recoveryTimer);
-  log("[session] halt round:", reason);
+  log("[session] reset round:", reason);
   if (turn) {
     try { sessions?.forget(turn.key); } catch { log("[session] failed to clear request id"); }
-    rejectSink(turn.sse, "这一轮没有跑起来(空响应),你刚才那条消息没有被回答 —— 原样重发一次就行。");
+    rejectSink(turn.sse, currentMessage || "这一轮没有跑起来,你刚才那条消息没有被回答 —— 原样重发一次就行。");
     turn = null;
   }
   busy = false;
-  for (const item of queue.splice(0)) rejectSink(item.sse, "上一轮空转,这条消息没有发送,请重发。");
+  for (const item of queue.splice(0)) rejectSink(item.sse, queuedMessage || "上一轮没有跑完,这条消息没有发送,请重发。");
   const old = proc; proc = null; nativeSessionId = null;
   old?.kill();
   // 轻量知会 + 30 分钟节流:偶发一次是线路抖,连续出现她该知道。连续空转的
   // 升级报警仍由 deadWatch 按它自己的节奏负责,这里不抢它的活。
   if (Date.now() - lastHaltNoticeAt > 30 * 60000) {
     lastHaltNoticeAt = Date.now();
-    tgSend(
+    tgSend(notice ||
       `⚠️ 刚才一轮空转(${reason}),已自动复位,窗口没有丢。` +
       `偶发一次多半是线路抖动;反复出现的话,可能是凭据或代理出了问题。`
     ).catch((e) => log("[tg-err]", e.message));
   }
+}
+function haltRound(reason) {
+  return resetRound(reason, {
+    currentMessage: "这一轮没有跑起来(空响应),你刚才那条消息没有被回答 —— 原样重发一次就行。",
+    queuedMessage: "上一轮空转,这条消息没有发送,请重发。",
+  });
+}
+function apiErrorDetail(ev) {
+  const raw = typeof ev?.result === "string" ? ev.result
+    : ev?.result == null ? "上游没有返回错误详情" : JSON.stringify(ev.result);
+  return String(raw).replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 800);
+}
+function haltApiError(ev) {
+  const detail = apiErrorDetail(ev);
+  const status = ev?.api_error_status == null ? "" : ` (${String(ev.api_error_status).slice(0, 40)})`;
+  log("[upstream] API error" + status + ":", detail);
+  return resetRound("cli_api_error", {
+    currentMessage: `上游 API 拒绝了这一轮${status}：${detail}。窗口已自动回滚到上一条确认存档点；请原样重发一次。`,
+    queuedMessage: "上一轮被上游 API 拒绝,这条消息没有发送,请重发。",
+    notice: `⚠️ 上游 API 刚才拒绝了一轮${status},服务已自动复位,窗口没有丢。\n${detail}`,
+  });
 }
 // 压缩撞车复位(2026-10-10,10-09 深夜两次停机的修补):压缩或闸门拦截撞上了
 // 正在跑的回合 —— 来历清楚的事故,不该全线停机逼她半夜去点 Restart。
@@ -255,14 +280,21 @@ if (SYSTEM_PROMPT_MODE === "replace" && process.env.SOUL_ANCHOR !== undefined)
 //   2. 窗口用量到 WINDOW_WARN_PCT 就提醒她归档换窗 —— 摘要瘦身之后,「上次归档到现在」
 //      这一段只存在于窗口里,不及时归档就真的没了。
 const COMPACT_HOOK = process.env.COMPACT_HOOK !== "0";
-const WINDOW_LIMIT = +(process.env.WINDOW_LIMIT || DEFAULT_WINDOW_LIMIT);
+const WINDOW_LIMIT_OVERRIDE = +(process.env.WINDOW_LIMIT || 0);
+const modelWindowLimit = () => windowLimitForModel(spawnedModel || MODEL);
+// 线上从 200k 升到 1M 时往往还留着旧默认 WINDOW_LIMIT=167000。这个**恰好等于旧默认**
+// 的值视为历史残留并随模型迁移；其余显式数值仍是有意覆盖，原样尊重。
+const staleLegacyWindowOverride = () =>
+  WINDOW_LIMIT_OVERRIDE === DEFAULT_WINDOW_LIMIT && modelWindowLimit() > DEFAULT_WINDOW_LIMIT;
+const configuredWindowLimit = () => WINDOW_LIMIT_OVERRIDE > 0 && !staleLegacyWindowOverride()
+  ? WINDOW_LIMIT_OVERRIDE
+  : modelWindowLimit();
 // 压缩线的真实来源(交接邮件 §2):CLI 开机会发 autocompact_state,带本会话**真实**的
-// 触发阈值 —— 比我们按 200k 公式猜的准(模型上限变了也不用改配置)。没收到之前,
-// 配置值也要夹回 200k 公式线:残留的 1M 旧配置不能让监控上限虚高、提醒永远不响。
-// 只有 CLI 自己确认了更大的阈值(真·扩展上下文),才按确认值放大。
+// 触发阈值 —— 比我们按模型公式猜的准。没收到之前,按当前模型的上下文上限计算:
+// 旧模型走 167k；1M 的 claude-opus-5-5 走 967k。显式 WINDOW_LIMIT 可覆盖。
 let cliThreshold = null; // CLI 报告的 autocompact 触发线(token)
 const windowLimitNow = () =>
-  cliThreshold > 0 ? Math.min(WINDOW_LIMIT, cliThreshold) : Math.min(WINDOW_LIMIT, DEFAULT_WINDOW_LIMIT);
+  cliThreshold > 0 ? Math.min(configuredWindowLimit(), cliThreshold) : configuredWindowLimit();
 // 每个正常用户轮次的「验真回执」:只有元数据(模型名/档位/是否见到思考与签名/时长),
 // 不存任何聊天正文、思考正文或签名正文。内存环形,最多 20 条,/admin/window 展示。
 const receipts = [];
@@ -473,6 +505,8 @@ function spawnClaude(kelivoSystem, model) {
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
   spawnedSystem = kelivoSystem ?? spawnedSystem;
   spawnedModel = model || spawnedModel || MODEL;
+  // autocompact_state 属于当前 CLI 进程/模型；重启或切模型后必须重新等实报。
+  cliThreshold = null;
   const prompt = buildPromptArgs({
     mode: SYSTEM_PROMPT_MODE,
     worldbook: spawnedSystem,
@@ -682,7 +716,13 @@ function handleEvent(ev) {
   }
   if (ev.type === "result") {
     if (turn.committing) return;
-    if (ev.is_error || (ev.subtype && ev.subtype !== "success")) {
+    // Agent SDK 的 result/subtype=success 仍可能带 is_error=true：它表示这一次 API
+    // 请求被上游拒绝，并不表示 native 会话损坏。回滚本轮后即可恢复，不能永久停机。
+    if (ev.subtype === "success" && ev.is_error === true) {
+      pushReceipt(turn, "upstream-error");
+      return haltApiError(ev);
+    }
+    if (ev.is_error === true || (ev.subtype && ev.subtype !== "success")) {
       pushReceipt(turn, "upstream-error");
       const reason = "cli_result_" + (ev.subtype || "error");
       // 撞车(闸门拦截/压缩边界的硬信号在本轮出现过)→ 温和复位;没有信号照旧停机。
@@ -909,7 +949,7 @@ app.get("/debug", (_q, r) => r.json({
   },
   // 窗口离自动压缩还有多远 + 压缩到底发生过没有(排查时先看这里)
   window: {
-    tokens: windowTokens, limit: windowLimitNow(), configuredLimit: WINDOW_LIMIT, cliThreshold,
+    tokens: windowTokens, limit: windowLimitNow(), configuredLimit: configuredWindowLimit(), cliThreshold,
     pct: windowPct(windowTokens, windowLimitNow()), warnPct: WINDOW_WARN_PCT, warned: windowWarned,
     autoArchive: WINDOW_AUTO_ARCHIVE, archivePct: WINDOW_ARCHIVE_PCT, autoArchived: windowAutoArchived,
     compactHook: COMPACT_HOOK, compactions,
@@ -975,9 +1015,13 @@ function ccVersion() {
   return ccVersionCache;
 }
 function adminSnapshot() {
+  const configuredLimit = configuredWindowLimit();
   return {
-    tokens: windowTokens, limit: windowLimitNow(), configuredLimit: WINDOW_LIMIT,
-    limitSource: cliThreshold ? "CLI 实报(autocompact_state)" : "200k 公式线(CLI 尚未报告)",
+    tokens: windowTokens, limit: windowLimitNow(), configuredLimit,
+    limitSource: cliThreshold ? "CLI 实报(autocompact_state)"
+      : staleLegacyWindowOverride() ? "旧 167k 配置已按 1M 模型迁移(CLI 尚未报告)"
+      : WINDOW_LIMIT_OVERRIDE > 0 ? "WINDOW_LIMIT 配置线(CLI 尚未报告)"
+      : configuredLimit > 167000 ? "1M 模型公式线(CLI 尚未报告)" : "200k 模型公式线(CLI 尚未报告)",
     warnPct: WINDOW_WARN_PCT, archivePct: WINDOW_ARCHIVE_PCT,
     warned: windowWarned, archived: windowAutoArchived,
     compactions, lastCompactAt, lastCompactPre,
