@@ -259,6 +259,37 @@ test("SDK success+is_error is recoverable, reports the API reason, and preserves
   } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
 });
 
+test("prompt-too-long retires the oversized checkpoint and safely hands confirmed history to a fresh native session", async () => {
+  const f = setup(); let s;
+  try {
+    s = await start(f);
+    assert.equal(await answer(s, "remember:willow-884"), "ack:remember:willow-884");
+    const before = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    const failed = await s.send("PROMPT_TOO_LONG_NOW", "too-long-1");
+    assert.equal(failed.status, 503);
+    assert.match((await failed.json()).error.message, /安全续接|已保留备份/);
+    assert.equal((await s.health()).session.phase, "pending");
+
+    const rolled = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    assert.equal(rolled.sessionId, null);
+    assert.equal(rolled.checkpoint, null);
+    assert.ok(rolled.handoff.entries.length > 0);
+    assert.ok(rolled.retiredCheckpoints.includes(before.checkpoint));
+    assert.ok(fs.existsSync(path.join(f.dir, before.checkpoint)), "old checkpoint remains recoverable");
+
+    await s.stop();
+    s = await start(f, 2); // the handoff itself must survive a container restart
+    assert.equal(await answer(s, "continue", "too-long-1"), "ack:continue", "same request ID is admitted");
+    const run = readLines(f.runs).at(-1);
+    assert.equal(run.args.includes("--resume"), false, "oversized native session is not retried forever");
+    const prompt = run.args[run.args.indexOf("--append-system-prompt") + 1];
+    assert.match(prompt, /previous native session exceeded/);
+    assert.match(prompt, /willow-884/);
+    assert.doesNotMatch(prompt, /PROMPT_TOO_LONG_NOW/, "failed input is not included in the handoff");
+    assert.equal((await s.health()).session.phase, "ready");
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
 test("durable state is pruned: oversized fallback history is trimmed and stale request IDs expire", () => {
   const state = { history: [], historyComplete: true, requests: {
     old: { status: "completed", at: 1 },

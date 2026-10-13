@@ -40,6 +40,11 @@ rl.on("line", (line) => {
       result: "mock upstream rate limit", session_id: id, usage: { output_tokens: 0 } });
     return;
   }
+  if (text === "PROMPT_TOO_LONG_NOW") {
+    emit({ type: "result", subtype: "success", is_error: true, api_error_status: 400,
+      result: "Prompt is too long", session_id: id, usage: { output_tokens: 0 } });
+    return;
+  }
   const known = history.filter((r) => r.type === "user").map((r) => r.message.content).find((s) => typeof s === "string" && s.startsWith("remember:"));
   const output = text === "recall" ? (known?.slice(9) || "UNKNOWN") : "ack:" + text;
   setTimeout(() => {

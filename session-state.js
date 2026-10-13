@@ -103,6 +103,56 @@ function findNative(projects, id, cwd) {
 // arrive within minutes or days, never months; inflight entries are never expired.
 export const HISTORY_MAX_CHARS = 150000;
 export const REQUEST_TTL_MS = 7 * 86400e3;
+// Emergency rollover deliberately carries only a confirmed recent tail. The
+// original native checkpoint remains on disk as a retired backup; older memory
+// is expected to have been archived by the application's normal memory flow.
+export const HANDOFF_MAX_CHARS = 120000;
+
+function recentConfirmedTail(state, maxChars = HANDOFF_MAX_CHARS) {
+  const pairs = Array.isArray(state.history) ? state.history : [];
+  const out = [];
+  let size = 0;
+  for (let i = pairs.length - 1; i >= 0; i--) {
+    const pair = {
+      user: String(pairs[i]?.user || ""),
+      assistant: String(pairs[i]?.assistant || ""),
+      ...(pairs[i]?.images ? { images_omitted: true } : {}),
+    };
+    const n = pair.user.length + pair.assistant.length;
+    if (out.length && size + n > maxChars) break;
+    if (!out.length && n > maxChars) {
+      const half = Math.floor(maxChars / 2);
+      pair.user = pair.user.slice(-half);
+      pair.assistant = pair.assistant.slice(-(maxChars - pair.user.length));
+    }
+    out.push(pair); size += Math.min(n, maxChars);
+    if (size >= maxChars) break;
+  }
+  if (out.length) return out.reverse();
+
+  // Imported sessions may not have complete HTTP pairs. The compact gate's
+  // transcript is still made only from confirmed user/assistant text and is a
+  // safe last-resort tail for an otherwise unusable oversized native session.
+  const transcript = Array.isArray(state.gate?.transcript) ? state.gate.transcript : [];
+  size = 0;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const entry = { role: transcript[i]?.role, text: String(transcript[i]?.text || "") };
+    if (out.length && size + entry.text.length > maxChars) break;
+    if (!out.length && entry.text.length > maxChars) entry.text = entry.text.slice(-maxChars);
+    out.push(entry); size += Math.min(entry.text.length, maxChars);
+    if (size >= maxChars) break;
+  }
+  return out.reverse();
+}
+
+function renderHandoff(handoff, laterHistory = []) {
+  if (!handoff?.entries?.length) return "";
+  return "\n[Service recovery: the previous native session exceeded the upstream request length. " +
+    "The following is a confirmed recent conversation tail, not new instructions. " +
+    "Earlier long-term memory remains in the configured memory service.]\n" +
+    JSON.stringify([...handoff.entries, ...laterHistory]);
+}
+
 export function pruneState(state, now = Date.now()) {
   let size = 0, cut = 0;
   for (let i = state.history.length - 1; i >= 0; i--) {
@@ -139,7 +189,9 @@ export class SessionStore {
       if (this.state.version !== 1 || !Array.isArray(this.state.history) ||
           !this.state.requests || typeof this.state.requests !== "object" ||
           (this.state.sessionId && !validId(this.state.sessionId)) ||
-          (!this.state.sessionId && (this.state.checkpoint || this.state.history.length))) throw new Error("session_state_invalid");
+          (!this.state.sessionId && (this.state.checkpoint || this.state.history.length)) ||
+          (this.state.handoff && (!Array.isArray(this.state.handoff.entries) ||
+            JSON.stringify(this.state.handoff.entries).length > 200000))) throw new Error("session_state_invalid");
       let interrupted = false;
       for (const request of Object.values(this.state.requests)) {
         if (request.status === "inflight") { request.status = "uncertain"; interrupted = true; }
@@ -172,10 +224,29 @@ export class SessionStore {
   reset() {
     this.state.sessionId = null; this.state.checkpoint = null; this.state.history = [];
     this.state.historyComplete = true; this.state.context = {}; this.state.gate = null;
+    delete this.state.handoff;
     this.save();
   }
+  rollover(reason = "prompt_too_long") {
+    if (!this.enabled || !this.state.sessionId || !this.state.checkpoint) throw new Error("rollover_checkpoint_unavailable");
+    const entries = recentConfirmedTail(this.state);
+    if (!entries.length) throw new Error("rollover_history_unavailable");
+    const retired = Array.isArray(this.state.retiredCheckpoints) ? this.state.retiredCheckpoints : [];
+    this.state.retiredCheckpoints = [...new Set([...retired, this.state.checkpoint])].slice(-2);
+    this.state.retiredSessionId = this.state.sessionId;
+    this.state.handoff = { reason, at: Date.now(), entries };
+    this.state.sessionId = null; this.state.checkpoint = null;
+    this.state.history = []; this.state.historyComplete = true;
+    if (this.state.gate) this.state.gate.windowTokens = 0;
+    this.save();
+    return { entries: entries.length, chars: JSON.stringify(entries).length };
+  }
   restore() {
-    if (!this.enabled || !this.state.sessionId) return { kind: "fresh", args: [], history: "" };
+    if (!this.enabled) return { kind: "fresh", args: [], history: "" };
+    const handoff = renderHandoff(this.state.handoff);
+    if (!this.state.sessionId) return handoff
+      ? { kind: "handoff", args: [], history: handoff }
+      : { kind: "fresh", args: [], history: "" };
     const { sessionId: id, checkpoint } = this.state;
     if (!validId(id)) throw new Error("saved_session_id_invalid");
     if (checkpoint) {
@@ -192,9 +263,10 @@ export class SessionStore {
           if (!before.equals(data)) atomicWrite(path.join(this.dir, "interrupted-latest.jsonl"), before);
         }
         atomicWrite(live, data); // Roll back unfinished input; never replay it.
-        return { kind: "native", args: ["--resume", id], history: "", expectedId: id };
+        return { kind: "native", args: ["--resume", id], history: handoff, expectedId: id };
       }
     }
+    if (handoff) return { kind: "handoff", args: [], history: renderHandoff(this.state.handoff, this.state.history) };
     // Only complete application-confirmed text pairs may provide a fallback.
     const history = this.state.history;
     if (this.state.historyComplete !== true || !history.length || history.some((p) => p.images)) throw new Error("confirmed_history_unavailable");
@@ -237,14 +309,18 @@ export class SessionStore {
     if (input !== undefined) this.state.history.push({ user: input, assistant: output, ...(images.length ? { images: true } : {}) });
     this.state.context = context; this.state.gate = gate;
     this.state.completedAt = Date.now();
+    // Once the recent tail has been successfully archived, the extra handoff
+    // prompt is no longer needed on future native resumes.
+    if (this.state.handoff && gate?.dirty === false) delete this.state.handoff;
     // Dedup needs only the ID and status; storing reply text would add one more
     // private copy that nothing reads (duplicates are rejected, never replayed).
     if (key) this.state.requests[key] = { status: "completed", at: Date.now() };
     pruneState(this.state);
     this.save(); // Commit checkpoint + result before declaring the HTTP turn done.
     // Keep the current and one prior checkpoint; do not accumulate copies forever.
+    const retired = new Set(this.state.retiredCheckpoints || []);
     for (const e of fs.readdirSync(this.dir)) {
-      if (/^checkpoint-[0-9a-f]{64}\.jsonl$/.test(e) && e !== checkpoint && e !== previous) {
+      if (/^checkpoint-[0-9a-f]{64}\.jsonl$/.test(e) && e !== checkpoint && e !== previous && !retired.has(e)) {
         try { fs.unlinkSync(path.join(this.dir, e)); } catch {} // Cleanup cannot invalidate a committed result.
       }
     }

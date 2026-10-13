@@ -224,6 +224,17 @@ function haltApiError(ev) {
   const detail = apiErrorDetail(ev);
   const status = ev?.api_error_status == null ? "" : ` (${String(ev.api_error_status).slice(0, 40)})`;
   log("[upstream] API error" + status + ":", detail);
+  if (sessionDir && /prompt is too long/i.test(detail)) {
+    let handoff;
+    try { handoff = sessions.rollover("cli_prompt_too_long"); }
+    catch (e) { return blockRecovery(sessionReason(e)); }
+    log("[session] oversized native checkpoint retired; handoff", handoff);
+    return resetRound("cli_prompt_too_long", {
+      currentMessage: "旧会话恢复时超过了上游实际可接受的请求长度。旧检查点已保留备份，最近已确认的对话已安全续接到新窗口；请原样重发刚才这条消息。",
+      queuedMessage: "旧会话正在安全续接，这条消息没有发送，请重发。",
+      notice: "⚠️ 旧原生会话被上游判定 Prompt is too long。已保留旧检查点，并把最近已确认对话续接到新窗口；原消息可直接重发。",
+    });
+  }
   return resetRound("cli_api_error", {
     currentMessage: `上游 API 拒绝了这一轮${status}：${detail}。窗口已自动回滚到上一条确认存档点；请原样重发一次。`,
     queuedMessage: "上一轮被上游 API 拒绝,这条消息没有发送,请重发。",
@@ -544,7 +555,11 @@ function spawnClaude(kelivoSystem, model) {
   // Legacy mode retains its original compact-replay behavior.
   const carry = !sessionDir && COMPACT_REPLAY && dirty && transcript.length ? transcript.slice() : null;
   const savedGate = sessionDir && restored.kind !== "fresh" ? sessions.state.gate : null;
-  windowTokens = savedGate?.windowTokens || 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
+  // A history/handoff restore starts a genuinely fresh native context. Keep
+  // the unarchived transcript, but do not carry the retired window's token
+  // count into the new process.
+  windowTokens = restored.kind === "native" ? (savedGate?.windowTokens || 0) : 0;
+  windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
   dirty = savedGate?.dirty || false; compactBlocks = 0; archiveAttempts = 0; transcript = savedGate?.transcript || [];
   lastArchiveAt = savedGate?.lastArchiveAt || null;
   if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); setTimeout(() => replayTurn(carry), 0); }

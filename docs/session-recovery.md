@@ -86,6 +86,15 @@ next recovery — deletes the round's request ID so the exact same message can b
 resent, rejects the turn with a resend hint, and sends a rate-limited operator
 notice. The dead-turn watcher keeps its own escalation cadence.
 
+An upstream `Prompt is too long` response is also recoverable, but retrying the
+same native checkpoint would loop forever. The shim therefore retires (without
+deleting) that checkpoint, creates a bounded handoff from the most recent
+application-confirmed user/assistant pairs, keeps the compact-gate transcript,
+and starts a fresh native session on the exact resend. The failed input is not
+included in the handoff and its request ID is forgotten. The retired checkpoint
+remains on the private volume for manual recovery. The handoff prompt remains
+attached to native resumes until a successful archive clears the dirty gate.
+
 Durable state is pruned every committed round: fallback history is trimmed to a
 recent tail (marking it incomplete, which disables only the fallback; native
 checkpoints remain the recovery path), and completed/uncertain request IDs
