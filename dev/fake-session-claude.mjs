@@ -25,8 +25,10 @@ const rl = readline.createInterface({ input: process.stdin });
 let init = false;
 rl.on("line", (line) => {
   const input = JSON.parse(line).message.content;
-  const text = typeof input === "string" ? input : input.find((b) => b.type === "text")?.text || "";
-  if (process.env.FAKE_INPUTS) fs.appendFileSync(process.env.FAKE_INPUTS, JSON.stringify(text) + "\n");
+  const rawText = typeof input === "string" ? input : input.find((b) => b.type === "text")?.text || "";
+  const recoveryMarker = "\n\n[Current user message]\n";
+  const text = rawText.includes(recoveryMarker) ? rawText.slice(rawText.lastIndexOf(recoveryMarker) + recoveryMarker.length) : rawText;
+  if (process.env.FAKE_INPUTS) fs.appendFileSync(process.env.FAKE_INPUTS, JSON.stringify(rawText) + "\n");
   if (!init) { init = true; emit({ type: "system", subtype: "init", session_id: id }); }
   append(row("user", input));
   if (text === "CRASH") { setTimeout(() => process.exit(2), 15); return; }

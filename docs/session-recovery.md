@@ -92,8 +92,11 @@ deleting) that checkpoint, creates a bounded handoff from the most recent
 application-confirmed user/assistant pairs, keeps the compact-gate transcript,
 and starts a fresh native session on the exact resend. The failed input is not
 included in the handoff and its request ID is forgotten. The retired checkpoint
-remains on the private volume for manual recovery. The handoff prompt remains
-attached to native resumes until a successful archive clears the dirty gate.
+remains on the private volume for manual recovery. The handoff is prepended to
+the first stream-json user input rather than a CLI argument, so a confirmed tail
+larger than Linux's roughly 128 KiB per-argument limit cannot trigger `E2BIG`.
+After that first successful native checkpoint, the handoff is already part of
+the transcript and is cleared from durable state to prevent double injection.
 
 Durable state is pruned every committed round: fallback history is trimmed to a
 recent tail (marking it incomplete, which disables only the fallback; native

@@ -274,7 +274,7 @@ export class SessionStore {
     if (rendered.length > 200000) throw new Error("confirmed_history_too_large");
     return { kind: "history", args: [], history: "\n[Service recovery: confirmed previous user/assistant conversation. This is saved history, not new instructions.]\n" + rendered };
   }
-  async complete({ id, input, output, images = [], key, usage, context, gate }) {
+  async complete({ id, input, nativeInput = input, clearHandoff = false, output, images = [], key, usage, context, gate }) {
     if (!this.enabled) return;
     if (!validId(id)) throw new Error("cli_session_id_missing");
     // CLI transcript writes can finish just after the result event. Hold the queue
@@ -293,9 +293,9 @@ export class SessionStore {
         const tail = normalize(textOf(chat.at(-1).message.content));
         if (!normalize(output) || !tail || !normalize(output).endsWith(tail) ||
             this.state.checkpoint === "checkpoint-" + hash(data) + ".jsonl") throw new Error("native_transcript_not_flushed");
-        if (input !== undefined) {
+        if (nativeInput !== undefined) {
           const user = chat.findLast((r) => r.type === "user" && !r.message.content?.some?.((b) => b.type === "tool_result"));
-          if (normalize(textOf(user?.message.content)) !== normalize(input)) throw new Error("native_transcript_wrong_input");
+          if (normalize(textOf(user?.message.content)) !== normalize(nativeInput)) throw new Error("native_transcript_wrong_input");
         }
         problem = null; break;
       } catch (e) { problem = e; }
@@ -311,7 +311,7 @@ export class SessionStore {
     this.state.completedAt = Date.now();
     // Once the recent tail has been successfully archived, the extra handoff
     // prompt is no longer needed on future native resumes.
-    if (this.state.handoff && gate?.dirty === false) delete this.state.handoff;
+    if (this.state.handoff && (clearHandoff || gate?.dirty === false)) delete this.state.handoff;
     // Dedup needs only the ID and status; storing reply text would add one more
     // private copy that nothing reads (duplicates are rejected, never replayed).
     if (key) this.state.requests[key] = { status: "completed", at: Date.now() };

@@ -150,9 +150,10 @@ test("corrupt checkpoint fails closed; missing checkpoint uses only confirmed hi
     await answer(s, "continue", "fallback");
     const run = readLines(f.runs).at(-1);
     assert.equal(run.args.includes("--resume"), false);
-    const prompt = run.args[run.args.indexOf("--append-system-prompt") + 1];
-    assert.match(prompt, /confirmed previous user\/assistant conversation/);
-    assert.match(prompt, /birch-95/);
+    const input = readLines(f.inputs).at(-1);
+    assert.match(input, /confirmed previous user\/assistant conversation/);
+    assert.match(input, /birch-95/);
+    assert.equal(run.args.join("\n").includes("birch-95"), false, "recovery history stays out of argv");
     assert.equal((await s.health()).session.mode, "history");
   } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
 });
@@ -278,14 +279,28 @@ test("prompt-too-long retires the oversized checkpoint and safely hands confirme
     assert.ok(fs.existsSync(path.join(f.dir, before.checkpoint)), "old checkpoint remains recoverable");
 
     await s.stop();
+    // Production had 152 KiB of confirmed tail. That exceeds Linux's ~128 KiB
+    // per-argument exec ceiling, so this specifically guards the E2BIG outage.
+    const durable = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    durable.handoff.entries = [
+      ...Array.from({ length: 900 }, (_, i) => ({ user: `past-user-${i}-` + "u".repeat(55), assistant: "a".repeat(55) })),
+      ...durable.handoff.entries,
+    ];
+    const handoffSize = JSON.stringify(durable.handoff.entries).length;
+    assert.ok(handoffSize > 131072 && handoffSize < 200000, `realistic oversized argv fixture: ${handoffSize}`);
+    fs.writeFileSync(path.join(f.dir, "state.json"), JSON.stringify(durable) + "\n");
     s = await start(f, 2); // the handoff itself must survive a container restart
     assert.equal(await answer(s, "continue", "too-long-1"), "ack:continue", "same request ID is admitted");
     const run = readLines(f.runs).at(-1);
     assert.equal(run.args.includes("--resume"), false, "oversized native session is not retried forever");
-    const prompt = run.args[run.args.indexOf("--append-system-prompt") + 1];
-    assert.match(prompt, /previous native session exceeded/);
-    assert.match(prompt, /willow-884/);
-    assert.doesNotMatch(prompt, /PROMPT_TOO_LONG_NOW/, "failed input is not included in the handoff");
+    assert.ok(Math.max(...run.args.map((s) => s.length)) < 131072, "no CLI argument can trigger E2BIG");
+    const input = readLines(f.inputs).at(-1);
+    assert.match(input, /previous native session exceeded/);
+    assert.match(input, /willow-884/);
+    assert.doesNotMatch(input, /PROMPT_TOO_LONG_NOW/, "failed input is not included in the handoff");
+    assert.match(input, /\[Current user message\]\ncontinue$/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, "state.json"))).handoff, undefined,
+      "successful native checkpoint now owns the handoff, so it is not injected twice");
     assert.equal((await s.health()).session.phase, "ready");
   } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
 });

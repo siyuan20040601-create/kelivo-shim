@@ -483,6 +483,10 @@ function replayTurn(entries = transcript) {
 
 // ---- 常驻 claude 进程 --------------------------------------------------------
 let proc = null, outBuf = "", busy = false;
+// Confirmed fallback/handoff history can be larger than Linux's per-argument
+// exec limit (~128 KiB). Keep it out of argv and prepend it to the first
+// stream-json user input instead; stdin has no such limit.
+let recoveryHistory = "";
 let spawnedSystem = sessions?.state.context?.system || "", spawnedModel = sessions?.state.context?.model || MODEL;
 // 实际生效的模式(replace 可能因 CLI 不支持而降级)。spawn 之前是 null ——
 // /debug 那里如实报「还没起进程」,不要让面板显示一个还没验证过的 replace(手册 §9:
@@ -527,11 +531,7 @@ function spawnClaude(kelivoSystem, model) {
     anchor: SOUL_ANCHOR, base: SYSTEM_PROMPT, hardRule: HARD_RULE,
   });
   promptMode = prompt.mode;
-  if (restored.history) {
-    const i = prompt.args.indexOf("--append-system-prompt");
-    if (i >= 0) prompt.args[i + 1] += restored.history;
-    else prompt.args.push("--append-system-prompt", restored.history);
-  }
+  recoveryHistory = restored.history || "";
   for (const n of prompt.notes) log("[sysprompt]", n);
   const args = [
     "-p",
@@ -816,7 +816,10 @@ function handleEvent(ev) {
       // 撞车轮的现场被压缩/闸门合法改写过,「最后一条 user 必须是她的原话」这条
       // 对不上是预期而非事故 —— 跳过 input 对账(传 undefined),尾部「正文确实落盘」
       // 的硬校验照旧跑,完整性不放水。没撞车的轮一个字不松。
-      id: nativeSessionId, input: compactCollision(finished) ? undefined : finished.input,
+      id: nativeSessionId,
+      input: compactCollision(finished) ? undefined : finished.input,
+      nativeInput: compactCollision(finished) ? undefined : finished.nativeInput,
+      clearHandoff: finished.recoveryInjected,
       output: finished.fullText,
       images: finished.images, key: finished.key, usage,
       context: { system: spawnedSystem, model: spawnedModel },
@@ -881,9 +884,16 @@ function pump() {
   // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
   // 它们不是他们俩说的话,记了只会挤掉真正该留的内容。
   if (turn.kind === "user") recordTranscript("user", item.text);
-  const content = item.images && item.images.length
-    ? [{ type: "text", text: item.text }, ...item.images]
+  const injected = recoveryHistory;
+  recoveryHistory = ""; // Exactly once per fresh CLI process; the transcript persists it after success.
+  const nativeText = injected
+    ? injected + "\n\n[Current user message]\n" + item.text
     : item.text;
+  turn.nativeInput = nativeText;
+  turn.recoveryInjected = !!injected;
+  const content = item.images && item.images.length
+    ? [{ type: "text", text: nativeText }, ...item.images]
+    : nativeText;
   // Native --resume restores its transcript before interpreting this input.
   // No inference output is accepted until the CLI confirms the expected session.
   proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
