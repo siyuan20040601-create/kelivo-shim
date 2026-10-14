@@ -95,6 +95,11 @@ included in the handoff and its request ID is forgotten. The retired checkpoint
 remains on the private volume for manual recovery. The handoff is prepended to
 the first stream-json user input rather than a CLI argument, so a confirmed tail
 larger than Linux's roughly 128 KiB per-argument limit cannot trigger `E2BIG`.
+Its actual serialized size is capped at 60 KiB (rather than counting only
+message text), leaving room for the CLI's system and tool prompts. Older
+handoffs are bounded automatically on startup. If the upstream still rejects
+that first recovery request as too long, the shim halves the handoff and admits
+the exact request ID again instead of entering a terminal recovery failure.
 After that first successful native checkpoint, the handoff is already part of
 the transcript and is cleared from durable state to prevent double injection.
 

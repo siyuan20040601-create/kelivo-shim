@@ -225,14 +225,25 @@ function haltApiError(ev) {
   const status = ev?.api_error_status == null ? "" : ` (${String(ev.api_error_status).slice(0, 40)})`;
   log("[upstream] API error" + status + ":", detail);
   if (sessionDir && /prompt is too long/i.test(detail)) {
-    let handoff;
-    try { handoff = sessions.rollover("cli_prompt_too_long"); }
+    let handoff, retryingHandoff = false;
+    try {
+      retryingHandoff = !!sessions.state.handoff && !sessions.state.sessionId;
+      handoff = retryingHandoff
+        ? sessions.shrinkHandoff("handoff_prompt_too_long")
+        : sessions.rollover("cli_prompt_too_long");
+    }
     catch (e) { return blockRecovery(sessionReason(e)); }
-    log("[session] oversized native checkpoint retired; handoff", handoff);
+    log(retryingHandoff
+      ? "[session] recovery handoff still oversized; reduced"
+      : "[session] oversized native checkpoint retired; handoff", handoff);
     return resetRound("cli_prompt_too_long", {
-      currentMessage: "旧会话恢复时超过了上游实际可接受的请求长度。旧检查点已保留备份，最近已确认的对话已安全续接到新窗口；请原样重发刚才这条消息。",
-      queuedMessage: "旧会话正在安全续接，这条消息没有发送，请重发。",
-      notice: "⚠️ 旧原生会话被上游判定 Prompt is too long。已保留旧检查点，并把最近已确认对话续接到新窗口；原消息可直接重发。",
+      currentMessage: retryingHandoff
+        ? "恢复尾部仍超过了上游本次实际可接受的长度，已自动缩小并保留旧检查点备份；请原样重发刚才这条消息。"
+        : "旧会话恢复时超过了上游实际可接受的请求长度。旧检查点已保留备份，最近已确认的对话已安全续接到新窗口；请原样重发刚才这条消息。",
+      queuedMessage: "旧会话正在安全缩减并续接，这条消息没有发送，请重发。",
+      notice: retryingHandoff
+        ? "⚠️ 恢复尾部仍被上游判定 Prompt is too long，已自动减半并保留旧检查点备份；原消息可直接重发。"
+        : "⚠️ 旧原生会话被上游判定 Prompt is too long。已保留旧检查点，并把最近已确认对话续接到新窗口；原消息可直接重发。",
     });
   }
   return resetRound("cli_api_error", {

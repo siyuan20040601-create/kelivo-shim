@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { SessionStore, prepareProjects, requestKey, pruneState } from "../session-state.js";
+import { HANDOFF_MAX_CHARS, SessionStore, prepareProjects, requestKey, pruneState } from "../session-state.js";
 const root = path.resolve(import.meta.dirname, "..");
 const pause = (ms = 20) => new Promise((r) => setTimeout(r, ms));
 const readLines = (f) => fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : [];
@@ -301,6 +301,46 @@ test("prompt-too-long retires the oversized checkpoint and safely hands confirme
     assert.match(input, /\[Current user message\]\ncontinue$/);
     assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, "state.json"))).handoff, undefined,
       "successful native checkpoint now owns the handoff, so it is not injected twice");
+    assert.equal((await s.health()).session.phase, "ready");
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
+test("legacy handoffs are serialized-size bounded and a still-too-long recovery halves itself without locking", async () => {
+  const f = setup(); let s;
+  try {
+    fs.mkdirSync(f.dir, { recursive: true });
+    const entries = Array.from({ length: 900 }, (_, i) => ({
+      user: `past-user-${i}-` + "u".repeat(40),
+      assistant: "a".repeat(40),
+    }));
+    assert.ok(JSON.stringify(entries).length > HANDOFF_MAX_CHARS);
+    fs.writeFileSync(path.join(f.dir, "state.json"), JSON.stringify({
+      version: 1, sessionId: null, checkpoint: null, history: [], historyComplete: true,
+      requests: {}, context: {}, handoff: { reason: "legacy_prompt_too_long", at: Date.now(), entries },
+    }) + "\n");
+
+    s = await start(f, 1, { FAKE_MAX_INPUT_CHARS: "35000" });
+    const migrated = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    const migratedChars = JSON.stringify(migrated.handoff.entries).length;
+    assert.ok(migratedChars <= HANDOFF_MAX_CHARS, `startup bound: ${migratedChars}`);
+
+    const first = await s.send("continue", "adaptive-handoff");
+    assert.equal(first.status, 503);
+    assert.match((await first.json()).error.message, /自动缩小/);
+    assert.equal((await s.health()).session.phase, "pending");
+    assert.equal((await s.health()).ok, true);
+
+    const reduced = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    const reducedChars = JSON.stringify(reduced.handoff.entries).length;
+    assert.ok(reducedChars < migratedChars && reducedChars <= Math.floor(migratedChars / 2));
+    assert.equal(reduced.requests[requestKey({}, "adaptive-handoff")], undefined,
+      "the rejected recovery input can be resent with the exact same ID");
+
+    assert.equal(await answer(s, "continue", "adaptive-handoff"), "ack:continue");
+    const inputs = readLines(f.inputs);
+    assert.ok(inputs.at(-2).length > 35000);
+    assert.ok(inputs.at(-1).length < 35000);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, "state.json"))).handoff, undefined);
     assert.equal((await s.health()).session.phase, "ready");
   } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
 });

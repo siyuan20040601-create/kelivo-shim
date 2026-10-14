@@ -106,9 +106,15 @@ export const REQUEST_TTL_MS = 7 * 86400e3;
 // Emergency rollover deliberately carries only a confirmed recent tail. The
 // original native checkpoint remains on disk as a retired backup; older memory
 // is expected to have been archived by the application's normal memory flow.
-export const HANDOFF_MAX_CHARS = 120000;
+const HANDOFF_SOURCE_MAX_CHARS = 120000;
+// Bound the serialized handoff, not only its message text. A long chat with
+// many short turns can add tens of thousands of JSON syntax tokens on top of
+// the text itself. This leaves room for Claude Code's system/tool prompt even
+// when the upstream account falls back to a smaller context tier.
+export const HANDOFF_MAX_CHARS = 60000;
+export const HANDOFF_MIN_CHARS = 8000;
 
-function recentConfirmedTail(state, maxChars = HANDOFF_MAX_CHARS) {
+function recentConfirmedTail(state, maxChars = HANDOFF_SOURCE_MAX_CHARS) {
   const pairs = Array.isArray(state.history) ? state.history : [];
   const out = [];
   let size = 0;
@@ -143,6 +149,51 @@ function recentConfirmedTail(state, maxChars = HANDOFF_MAX_CHARS) {
     if (size >= maxChars) break;
   }
   return out.reverse();
+}
+
+const handoffEntryTextSize = (entry) => Object.hasOwn(entry || {}, "role")
+  ? String(entry?.text || "").length
+  : String(entry?.user || "").length + String(entry?.assistant || "").length;
+const tailChars = (text, count) => count > 0 ? text.slice(-count) : "";
+
+function truncateHandoffEntry(entry, maxText) {
+  if (Object.hasOwn(entry || {}, "role")) {
+    return { ...entry, text: tailChars(String(entry?.text || ""), maxText) };
+  }
+  const user = String(entry?.user || ""), assistant = String(entry?.assistant || "");
+  if (user.length + assistant.length <= maxText) return { ...entry, user, assistant };
+  let userChars = Math.min(user.length, Math.floor(maxText / 2));
+  let assistantChars = Math.min(assistant.length, maxText - userChars);
+  userChars = Math.min(user.length, maxText - assistantChars);
+  return { ...entry, user: tailChars(user, userChars), assistant: tailChars(assistant, assistantChars) };
+}
+
+// Keep the newest complete entries whose actual JSON representation fits. If
+// one entry alone is oversized, retain the newest tail of both sides.
+function fitHandoffEntries(entries, maxSerializedChars) {
+  const source = Array.isArray(entries) ? entries : [];
+  const out = [];
+  let serializedChars = 2; // []
+  for (let i = source.length - 1; i >= 0; i--) {
+    const encoded = JSON.stringify(source[i]);
+    const extra = encoded.length + (out.length ? 1 : 0);
+    if (serializedChars + extra <= maxSerializedChars) {
+      out.unshift(source[i]); serializedChars += extra; continue;
+    }
+    if (out.length) break;
+
+    let low = 0, high = handoffEntryTextSize(source[i]), best = null;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const candidate = truncateHandoffEntry(source[i], mid);
+      if (JSON.stringify([candidate]).length <= maxSerializedChars) {
+        best = candidate; low = mid + 1;
+      } else high = mid - 1;
+    }
+    if (best) out.unshift(best);
+    break;
+  }
+  return out;
 }
 
 function renderHandoff(handoff, laterHistory = []) {
@@ -192,11 +243,18 @@ export class SessionStore {
           (!this.state.sessionId && (this.state.checkpoint || this.state.history.length)) ||
           (this.state.handoff && (!Array.isArray(this.state.handoff.entries) ||
             JSON.stringify(this.state.handoff.entries).length > 200000))) throw new Error("session_state_invalid");
-      let interrupted = false;
+      let changed = false;
       for (const request of Object.values(this.state.requests)) {
-        if (request.status === "inflight") { request.status = "uncertain"; interrupted = true; }
+        if (request.status === "inflight") { request.status = "uncertain"; changed = true; }
       }
-      if (interrupted) this.save();
+      // One-time migration for handoffs created before serialized-size
+      // accounting was introduced. The full retired checkpoint remains intact.
+      if (this.state.handoff && JSON.stringify(this.state.handoff.entries).length > HANDOFF_MAX_CHARS) {
+        this.state.handoff.entries = fitHandoffEntries(this.state.handoff.entries, HANDOFF_MAX_CHARS);
+        this.state.handoff.boundedAt = Date.now();
+        changed = true;
+      }
+      if (changed) this.save();
     } else if (!allowImport && fs.existsSync(path.join(dir, "projects")) &&
       fs.readdirSync(path.join(dir, "projects")).length) {
       throw new Error("existing_sessions_need_explicit_import");
@@ -229,7 +287,7 @@ export class SessionStore {
   }
   rollover(reason = "prompt_too_long") {
     if (!this.enabled || !this.state.sessionId || !this.state.checkpoint) throw new Error("rollover_checkpoint_unavailable");
-    const entries = recentConfirmedTail(this.state);
+    const entries = fitHandoffEntries(recentConfirmedTail(this.state), HANDOFF_MAX_CHARS);
     if (!entries.length) throw new Error("rollover_history_unavailable");
     const retired = Array.isArray(this.state.retiredCheckpoints) ? this.state.retiredCheckpoints : [];
     this.state.retiredCheckpoints = [...new Set([...retired, this.state.checkpoint])].slice(-2);
@@ -240,6 +298,26 @@ export class SessionStore {
     if (this.state.gate) this.state.gate.windowTokens = 0;
     this.save();
     return { entries: entries.length, chars: JSON.stringify(entries).length };
+  }
+  shrinkHandoff(reason = "handoff_prompt_too_long") {
+    if (!this.enabled || this.state.sessionId || !this.state.handoff?.entries?.length) {
+      throw new Error("handoff_unavailable");
+    }
+    const before = JSON.stringify(this.state.handoff.entries).length;
+    if (before <= HANDOFF_MIN_CHARS) throw new Error("handoff_minimum_exceeded");
+    const target = Math.max(HANDOFF_MIN_CHARS, Math.floor(before / 2));
+    const entries = fitHandoffEntries(this.state.handoff.entries, target);
+    const after = JSON.stringify(entries).length;
+    if (!entries.length || after >= before) throw new Error("handoff_shrink_failed");
+    this.state.handoff = {
+      ...this.state.handoff,
+      reason,
+      at: Date.now(),
+      attempts: (this.state.handoff.attempts || 0) + 1,
+      entries,
+    };
+    this.save();
+    return { entries: entries.length, chars: after, previousChars: before };
   }
   restore() {
     if (!this.enabled) return { kind: "fresh", args: [], history: "" };

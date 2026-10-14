@@ -47,6 +47,11 @@ rl.on("line", (line) => {
       result: "Prompt is too long", session_id: id, usage: { output_tokens: 0 } });
     return;
   }
+  if (+(process.env.FAKE_MAX_INPUT_CHARS || 0) > 0 && rawText.length > +process.env.FAKE_MAX_INPUT_CHARS) {
+    emit({ type: "result", subtype: "success", is_error: true, api_error_status: 400,
+      result: "Prompt is too long", session_id: id, usage: { output_tokens: 0 } });
+    return;
+  }
   const known = history.filter((r) => r.type === "user").map((r) => r.message.content).find((s) => typeof s === "string" && s.startsWith("remember:"));
   const output = text === "recall" ? (known?.slice(9) || "UNKNOWN") : "ack:" + text;
   setTimeout(() => {
