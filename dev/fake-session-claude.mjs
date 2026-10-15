@@ -56,7 +56,7 @@ rl.on("line", (line) => {
   const output = text === "recall" ? (known?.slice(9) || "UNKNOWN") : "ack:" + text;
   setTimeout(() => {
     append(row("assistant", [{ type: "text", text: output }]));
-    emit({ type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 30 } } } });
+    emit({ type: "stream_event", event: { type: "message_start", message: { model: (args[args.indexOf("--model") + 1] || "claude-opus-4-6").replace(/\[1m\]$/i, ""), usage: { input_tokens: 30 } } } });
     emit({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: output } } });
     emit({ type: "result", subtype: "success", session_id: id, usage: { output_tokens: 4 } });
   }, text.startsWith("SLOW") ? 250 : 10);

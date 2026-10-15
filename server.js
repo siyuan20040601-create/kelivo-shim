@@ -18,7 +18,7 @@ import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg, sttText, simpleEarLine } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { splitReactionSegments, canonicalReaction } from "./reactions.js";
-import { prefixFromMessageStart, windowPct, windowLimitForModel, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import { prefixFromMessageStart, windowPct, windowLimitForModel, DEFAULT_WINDOW_LIMIT, resolveContextModel, upstreamModelName } from "./window.js";
 import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
@@ -66,10 +66,12 @@ process.env.TZ = process.env.TZ || "Asia/Shanghai";
 
 const PORT = process.env.PORT || 8787;
 const SHIM_KEY = process.env.SHIM_KEY || "";
-const MODEL = process.env.BRAIN_MODEL || "claude-opus-4-6";
-// 可选模型列表(Kelivo 模型页会全部列出;切模型=进程重启=窗口重置,先归档再切)
+const resolveModel = (model) => resolveContextModel(model, process.env.OPUS_46_CONTEXT);
+const MODEL = resolveModel(process.env.BRAIN_MODEL || "claude-opus-4-6");
+// 切模型会重启 CLI，并续接已确认的原生会话。1M 是按部署显式开启的选项。
 const MODELS = (process.env.BRAIN_MODELS || "claude-opus-4-6,claude-opus-4-8,claude-fable-5")
-  .split(",").map((s) => s.trim()).filter(Boolean);
+  .split(",").map((s) => resolveModel(s.trim())).filter(Boolean);
+if (MODELS.includes("claude-opus-4-6") && !MODELS.includes("claude-opus-4-6[1m]")) MODELS.push("claude-opus-4-6[1m]");
 if (!MODELS.includes(MODEL)) MODELS.unshift(MODEL);
 const EFFORT = process.env.THINK_EFFORT || "low";
 // 按模型覆盖思考深度,格式 "model=effort,model=effort";没写的用 EFFORT
@@ -77,7 +79,7 @@ const EFFORT_OVERRIDES = Object.fromEntries(
   (process.env.THINK_EFFORT_OVERRIDES || "claude-fable-5=low")
     .split(",").map((s) => s.split("=").map((x) => x.trim())).filter((p) => p[0] && p[1])
 );
-const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT;
+const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT_OVERRIDES[upstreamModelName(model)] || EFFORT;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const MCP_CONFIG = process.env.MCP_CONFIG || ".mcp.json";
 const FORWARD_THINKING = process.env.FORWARD_THINKING !== "0";
@@ -327,7 +329,7 @@ function pushReceipt(t, status) {
     requestedModel: t.requestedModel || null, configuredModel: spawnedModel,
     upstreamModel: t.upstreamModel || null,
     effectiveEffort: effortFor(spawnedModel),
-    effortSource: EFFORT_OVERRIDES[spawnedModel] ? "按模型覆盖" : "全局默认",
+    effortSource: EFFORT_OVERRIDES[spawnedModel] || EFFORT_OVERRIDES[upstreamModelName(spawnedModel)] ? "按模型覆盖" : "全局默认",
     thinkingSeen: !!t.thinkingSeen, signatureSeen: !!t.signatureSeen,
     signatureLength: t.signatureLength || 0,
     startedAt: t.startedAt, completedAt: Date.now(), status,
@@ -498,7 +500,7 @@ let proc = null, outBuf = "", busy = false;
 // exec limit (~128 KiB). Keep it out of argv and prepend it to the first
 // stream-json user input instead; stdin has no such limit.
 let recoveryHistory = "";
-let spawnedSystem = sessions?.state.context?.system || "", spawnedModel = sessions?.state.context?.model || MODEL;
+let spawnedSystem = sessions?.state.context?.system || "", spawnedModel = resolveModel(sessions?.state.context?.model || MODEL);
 // 实际生效的模式(replace 可能因 CLI 不支持而降级)。spawn 之前是 null ——
 // /debug 那里如实报「还没起进程」,不要让面板显示一个还没验证过的 replace(手册 §9:
 // 一个看起来对、其实还没生效的读数,比没有读数更能把人带沟里)。
@@ -2217,7 +2219,8 @@ function handleMessages(req, res) {
   const system = systemToText(body.system);
   const stream = body.stream !== false;
   // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
-  const model = MODELS.includes(body.model) ? body.model : spawnedModel;
+  const requestedModel = resolveModel(body.model);
+  const model = MODELS.includes(requestedModel) ? requestedModel : spawnedModel;
   const key = requestKey(body, req.get("idempotency-key") || req.get("x-shim-message-id") || "");
   const sse = stream ? makeSSE(res) : makeCollector(res);
   // 急停 / 看活儿:Kelivo 这边同样管用。⚠️ 这条别删 —— 她在哪个前端说「停」都该停,

@@ -10,6 +10,7 @@
 // 页面零 JavaScript(15 秒刷新用 <meta refresh>),所以 CSP 可以收到最紧。
 import { timingSafeEqual, randomUUID } from "node:crypto";
 import express from "express";
+import { upstreamModelName } from "./window.js";
 
 const SESSION_MS = 30 * 60e3;   // 登录会话 30 分钟滑动过期,只存内存
 const FAIL_LIMIT = 5;           // 10 分钟内错 5 次 → 429
@@ -68,7 +69,7 @@ function loginPage(msg = "") {
 function receiptRows(receipts) {
   if (!receipts.length) return `<p style="color:#888">还没有用户轮次。</p>`;
   return receipts.map((r) => {
-    const match = !r.upstreamModel ? "…" : r.upstreamModel === (r.requestedModel || r.configuredModel) ? "一致 ✓"
+    const match = !r.upstreamModel ? "…" : upstreamModelName(r.upstreamModel) === upstreamModelName(r.configuredModel || r.requestedModel) ? "一致 ✓"
       : `<b style="color:#d33">不一致!</b>`;
     const st = { completed: "完成", "empty-result": "空轮 ⚠️", "upstream-error": "上游错误 ⚠️", interrupted: "中断 ⚠️" }[r.status] || r.status;
     return `<div style="border:1px solid #ddd;border-radius:8px;padding:10px;margin:8px 0;font-size:14px">

@@ -82,6 +82,32 @@ test("idle restart and clean-container rebuild resume native history; heartbeat 
   } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
 });
 
+test("4.6 升到 1M 后保留原生历史，旧 Kelivo 模型名不会降回 200k", async () => {
+  const f = setup(); let s;
+  try {
+    s = await start(f, 1, { BRAIN_MODEL: "claude-opus-4-6" });
+    await answer(s, "remember:context-1m");
+    const original = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json"))).sessionId;
+    await s.stop();
+    s = await start(f, 2, { BRAIN_MODEL: "claude-opus-5-5", OPUS_46_CONTEXT: "1m", THINK_EFFORT_OVERRIDES: "claude-opus-4-6=medium" });
+    assert.equal((await s.health()).model, "claude-opus-4-6[1m]");
+    const response = await fetch(s.base + "/messages", { method: "POST", headers: { "x-api-key": "test", "content-type": "application/json" },
+      body: JSON.stringify({ stream: false, model: "claude-opus-4-6", messages: [{ role: "user", content: "recall" }] }) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).content[0].text, "context-1m");
+    const run = readLines(f.runs).at(-1);
+    assert.equal(run.id, original);
+    assert.equal(run.args[run.args.indexOf("--model") + 1], "claude-opus-4-6[1m]");
+    assert.equal(run.args[run.args.indexOf("--effort") + 1], "medium");
+    const debug = await (await fetch(s.base + "/debug")).json();
+    assert.equal(debug.window.configuredLimit, 967000);
+    const login = await fetch(s.base + "/admin/window", { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "key=test" });
+    const page = await (await fetch(s.base + "/admin/window", { headers: { cookie: login.headers.get("set-cookie").split(";")[0] } })).text();
+    assert.match(page, /一致 ✓/);
+    assert.doesNotMatch(page, /不一致!/);
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
 test("interrupted message is uncertain, never replayed; restore discards unfinished native tail", async () => {
   const f = setup(); let s;
   try {

@@ -10,7 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert";
 import {
   prefixFromMessageStart, prefixOf, windowPct,
-  DEFAULT_WINDOW_LIMIT, EXTENDED_WINDOW_LIMIT, windowLimitForModel,
+  DEFAULT_WINDOW_LIMIT, EXTENDED_WINDOW_LIMIT, windowLimitForModel, resolveContextModel,
 } from "../window.js";
 
 const msgStart = (u) => ({ type: "message_start", message: { usage: u } });
@@ -75,4 +75,15 @@ test("claude-opus-5-5 按 1M 上下文计算 967k 压缩线", () => {
   assert.equal(windowLimitForModel("claude-opus-5-5"), 967000);
   assert.equal(windowLimitForModel("claude-opus-5-5-20261001"), 967000);
   assert.equal(windowLimitForModel("claude-opus-4-6"), 167000);
+});
+
+test("4.6 1M 显式启用；旧前端模型名映射且 200k 配置保持独立", () => {
+  assert.equal(windowLimitForModel("claude-opus-4-6[1m]"), 967000);
+  assert.equal(windowLimitForModel("claude-opus-4-6-20260205[1m]"), 967000);
+  assert.equal(windowLimitForModel("claude-opus-4-6"), 167000);
+  assert.equal(resolveContextModel("claude-opus-4-6", "1m"), "claude-opus-4-6[1m]");
+  assert.equal(resolveContextModel("claude-opus-4-6[1m]", "1m"), "claude-opus-4-6[1m]");
+  assert.equal(resolveContextModel("claude-opus-4-6"), "claude-opus-4-6");
+  assert.equal(resolveContextModel("claude-opus-5-5", "1m"), "claude-opus-5-5");
+  assert.equal(resolveContextModel("unrecognized", "1m"), "unrecognized");
 });

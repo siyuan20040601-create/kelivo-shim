@@ -13,10 +13,21 @@ export const DEFAULT_WINDOW_LIMIT = 167000;
 export const EXTENDED_WINDOW_LIMIT = 967000;
 
 export function windowLimitForModel(model = "") {
-  return /^claude-opus-5-5(?:-|$)/i.test(String(model))
+  return /^claude-opus-5-5(?:-|\[1m\]$|$)/i.test(String(model)) ||
+    /^claude-opus-4-6(?:-\d{8})?\[1m\]$/i.test(String(model))
     ? EXTENDED_WINDOW_LIMIT
     : DEFAULT_WINDOW_LIMIT;
 }
+
+// Opt-in per deployment. Existing Kelivo entries keep working without silently
+// switching a newly enabled 1M session back to the untagged 200k variant.
+export function resolveContextModel(model, opus46Context = "") {
+  const value = String(model || "");
+  return opus46Context === "1m" && /^claude-opus-4-6(?:-\d{8})?$/i.test(value)
+    ? value + "[1m]" : value;
+}
+
+export const upstreamModelName = (model) => String(model || "").replace(/\[1m\]$/i, "");
 
 // 一次 API 请求的「前缀大小」= 这次请求实际送进去的上下文。
 export const prefixOf = (u) =>
