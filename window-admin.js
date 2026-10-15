@@ -102,6 +102,7 @@ export function mountWindowAdmin(app, { key, snapshot, log = () => {} }) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="15"><title>窗口管理页</title></head>
 <body style="font-family:system-ui;max-width:480px;margin:16px auto;padding:0 16px">
+<nav><a href="/admin/session">会话管理</a> · <a href="/home">家门口</a></nav>
 <h2 style="margin-bottom:4px">窗口进度</h2>
 <div style="color:#888;font-size:13px">每 15 秒自动刷新 · 纯只读,不打扰他</div>
 ${bar(pct)}

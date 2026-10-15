@@ -384,3 +384,133 @@ test("durable state is pruned: oversized fallback history is trimmed and stale r
   assert.equal(state.historyComplete, false, "a trimmed history is no longer complete");
   assert.deepEqual(Object.keys(state.requests).sort(), ["fresh", "stuck"], "expired completed IDs removed; inflight kept");
 });
+
+async function sessionAdmin(s) {
+  const login = await fetch(s.base + "/admin/session/login", { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "key=test" });
+  assert.equal(login.status, 303);
+  assert.match(login.headers.get("set-cookie"), /HttpOnly; Secure; SameSite=Strict/);
+  const cookie = login.headers.get("set-cookie").split(";")[0];
+  return {
+    async form() {
+      const res = await fetch(s.base + "/admin/session", { headers: { cookie } });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("cache-control"), "no-store");
+      const html = await res.text();
+      return { csrf: html.match(/name="csrf" value="([^"]+)"/)[1], revision: html.match(/name="revision" value="([^"]+)"/)[1] };
+    },
+    post(form, fields = {}, extraHeaders = {}) {
+      return fetch(s.base + "/admin/session/action", { method: "POST", redirect: "manual",
+        headers: { cookie, "content-type": "application/x-www-form-urlencoded", ...extraHeaders },
+        body: new URLSearchParams({ ...form, ...fields }) });
+    },
+  };
+}
+
+test("session controls require authentication, CSRF, confirmation, current state and an idle runtime", async () => {
+  const f = setup(); let s;
+  try {
+    s = await start(f);
+    assert.equal((await fetch(s.base + "/admin/session?key=test")).status, 401);
+    assert.equal((await fetch(s.base + "/admin/session/action", { method: "POST" })).status, 401);
+    const admin = await sessionAdmin(s);
+    let form = await admin.form();
+    assert.equal(readLines(f.runs).length, 0); // Opening the page does not start Claude.
+    assert.equal((await admin.post({ ...form, csrf: "forged" }, { action: "restart" })).status, 403);
+    form = await admin.form();
+    assert.equal((await admin.post(form, { action: "fresh", model: "claude-opus-4-6", effort: "medium" })).status, 400);
+    form = await admin.form();
+    assert.equal((await admin.post(form, { action: "restart" }, { origin: "https://other.example" })).status, 403);
+    assert.equal((await admin.post(form, { action: "fresh", confirm: "yes", model: "--bad-model", effort: "medium" })).status, 400);
+    form = await admin.form();
+    await answer(s, "remember:guarded");
+    assert.equal((await admin.post(form, { action: "restart" })).status, 409); // Old tab cannot act on newer chat.
+    form = await admin.form();
+    const pending = s.send("SLOW busy");
+    for (let i = 0; i < 30 && !(await s.health()).busy; i++) await pause(5);
+    assert.equal((await s.health()).busy, true);
+    assert.equal((await admin.post(form, { action: "fresh", confirm: "yes", model: "claude-opus-4-6", effort: "medium" })).status, 409);
+    assert.equal((await pending).status, 200);
+    assert.equal(fs.existsSync(path.join(f.dir, "retired")), false);
+    assert.equal(await answer(s, "recall"), "guarded");
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
+test("session restart resumes history; fresh backs it up and persists selected model/effort across container rebuild", async () => {
+  const f = setup(); let s;
+  const env = { OPUS_46_CONTEXT: "1m", BRAIN_MODELS: "claude-opus-4-6,claude-opus-5-5" };
+  try {
+    s = await start(f, 1, env);
+    await answer(s, "remember:retained", "old-message");
+    const readState = () => JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    const id = readState().sessionId;
+    let admin = await sessionAdmin(s);
+    const restartForm = await admin.form();
+    assert.equal((await admin.post(restartForm, { action: "restart" })).status, 303);
+    assert.equal((await s.health()).session.phase, "pending");
+    assert.equal((await s.hb()).triggered, false);
+    assert.equal(readLines(f.inputs).length, 1);
+    assert.equal((await admin.post(restartForm, { action: "restart" })).status, 403);
+    assert.equal(await answer(s, "recall", "after-ui-restart"), "retained");
+    assert.equal(readState().sessionId, id);
+    const before = readState();
+    const freshForm = await admin.form();
+    assert.equal((await admin.post(freshForm, { action: "fresh", confirm: "yes", model: "claude-opus-5-5", effort: "medium" })).status, 303);
+    assert.equal(readState().sessionId, null);
+    assert.deepEqual(readState().history, []);
+    assert.equal(readState().handoff, undefined);
+    assert.deepEqual(readState().selection, { model: "claude-opus-5-5", effort: "medium" });
+    const backups = fs.readdirSync(path.join(f.dir, "retired"));
+    assert.equal(backups.length, 1);
+    const backup = path.join(f.dir, "retired", backups[0]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(backup, "state.json"))), before);
+    assert.equal(fs.readFileSync(path.join(backup, before.checkpoint), "utf8"), fs.readFileSync(path.join(backup, "native.jsonl"), "utf8"));
+    assert.equal(fs.statSync(path.join(backup, "state.json")).mode & 0o777, 0o600);
+    assert.equal((await s.hb()).triggered, false);
+    const inputs = readLines(f.inputs).length;
+    await admin.form();
+    assert.equal(readLines(f.inputs).length, inputs);
+    await s.stop();
+    s = await start(f, 2, env);
+    assert.equal((await s.health()).model, "claude-opus-5-5");
+    const res = await fetch(s.base + "/messages", { method: "POST", headers: { "x-api-key": "test", "content-type": "application/json", "idempotency-key": "fresh-recall" },
+      body: JSON.stringify({ stream: false, model: "claude-opus-4-6", messages: [{ role: "user", content: "recall" }] }) });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.model, "claude-opus-5-5");
+    assert.equal(body.content[0].text, "UNKNOWN"); // Old private history was not injected into the fresh session.
+    assert.notEqual(readState().sessionId, id);
+    const run = readLines(f.runs).at(-1);
+    assert.equal(run.args[run.args.indexOf("--model") + 1], "claude-opus-5-5");
+    assert.equal(run.args[run.args.indexOf("--effort") + 1], "medium");
+    assert.equal(run.args.includes("--resume"), false);
+    assert.equal((await s.send("remember:retained", "old-message")).status, 409); // Late retries stay deduplicated.
+    await answer(s, "new-turn-1"); await answer(s, "new-turn-2");
+    assert.equal(fs.existsSync(path.join(backup, before.checkpoint)), true); // Active checkpoint pruning cannot touch backup.
+    assert.deepEqual(readState().selection, { model: "claude-opus-5-5", effort: "medium" });
+    admin = await sessionAdmin(s);
+    const form = await admin.form();
+    assert.equal((await admin.post(form, { action: "fresh", confirm: "yes", model: "claude-opus-4-6", effort: "high" })).status, 303);
+    assert.equal((await s.health()).model, "claude-opus-4-6[1m]");
+    assert.equal((await (await fetch(s.base + "/debug")).json()).window.limit, 967000);
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});
+
+test("backup failure preserves active session; corrupt saved history is never silently cleared by restart", async () => {
+  const f = setup(); let s;
+  try {
+    s = await start(f);
+    await answer(s, "remember:backup-failure");
+    const before = fs.readFileSync(path.join(f.dir, "state.json"), "utf8");
+    fs.writeFileSync(path.join(f.dir, "retired"), "simulate an unwritable backup path");
+    const admin = await sessionAdmin(s);
+    assert.equal((await admin.post(await admin.form(), { action: "fresh", confirm: "yes", model: "claude-opus-4-6", effort: "medium" })).status, 503);
+    assert.equal(fs.readFileSync(path.join(f.dir, "state.json"), "utf8"), before);
+    assert.equal((await s.health()).session.phase, "ready");
+    assert.equal(await answer(s, "recall"), "backup-failure");
+    const state = JSON.parse(fs.readFileSync(path.join(f.dir, "state.json")));
+    fs.writeFileSync(path.join(f.dir, state.checkpoint), "damaged-checkpoint\n");
+    assert.equal((await admin.post(await admin.form(), { action: "restart" })).status, 503);
+    assert.equal((await s.health()).session.phase, "failed");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, "state.json"))).sessionId, state.sessionId);
+  } finally { await s?.stop(); fs.rmSync(f.temp, { recursive: true, force: true }); }
+});

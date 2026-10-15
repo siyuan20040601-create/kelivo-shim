@@ -243,6 +243,9 @@ export class SessionStore {
           (!this.state.sessionId && (this.state.checkpoint || this.state.history.length)) ||
           (this.state.handoff && (!Array.isArray(this.state.handoff.entries) ||
             JSON.stringify(this.state.handoff.entries).length > 200000))) throw new Error("session_state_invalid");
+      const selected = this.state.selection;
+      if (selected && (typeof selected.model !== "string" || !selected.model || selected.model.length > 150 ||
+          !["low", "medium", "high", "max"].includes(selected.effort))) throw new Error("session_selection_invalid");
       let changed = false;
       for (const request of Object.values(this.state.requests)) {
         if (request.status === "inflight") { request.status = "uncertain"; changed = true; }
@@ -284,6 +287,32 @@ export class SessionStore {
     this.state.historyComplete = true; this.state.context = {}; this.state.gate = null;
     delete this.state.handoff;
     this.save();
+  }
+  // Explicit user action. Back up before changing active pointers; ordinary
+  // checkpoint pruning never descends into this private retired directory.
+  startFresh({ model, effort, system = "" }) {
+    if (!this.enabled) throw new Error("session_storage_required");
+    if (typeof model !== "string" || !model || !["low", "medium", "high", "max"].includes(effort)) {
+      throw new Error("session_selection_invalid");
+    }
+    const backup = path.join(this.dir, "retired", randomUUID());
+    for (const name of [this.state.checkpoint, ...(this.state.retiredCheckpoints || [])].filter(Boolean)) {
+      if (!/^checkpoint-[0-9a-f]{64}\.jsonl$/.test(name)) throw new Error("checkpoint_path_invalid");
+      // Missing checkpoints remain recorded in state.json; never invent history.
+      const source = path.join(this.dir, name);
+      if (fs.existsSync(source)) atomicWrite(path.join(backup, name), fs.readFileSync(source));
+    }
+    const native = findNative(this.projects, this.state.sessionId, this.cwd);
+    if (native) atomicWrite(path.join(backup, "native.jsonl"), fs.readFileSync(native));
+    atomicWrite(path.join(backup, "state.json"), JSON.stringify(this.state) + "\n");
+    const next = {
+      version: 1, sessionId: null, checkpoint: null, history: [], historyComplete: true,
+      requests: this.state.requests, context: { system, model }, gate: null,
+      selection: { model, effort }, retiredAt: Date.now(),
+    };
+    // Do not mutate in-memory state if backup or commit fails.
+    atomicWrite(this.file, JSON.stringify(next) + "\n");
+    this.state = next;
   }
   rollover(reason = "prompt_too_long") {
     if (!this.enabled || !this.state.sessionId || !this.state.checkpoint) throw new Error("rollover_checkpoint_unavailable");

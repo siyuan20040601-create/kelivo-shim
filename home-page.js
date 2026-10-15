@@ -171,7 +171,7 @@ ${HOUSE_SVG}
 <div class="room">${KITTEN_SVG}<h2>小汉堡的窝</h2><p>睡成一团。<br>呼噜声循环播放中。</p></div>
 
 <div class="foot">这一页纯只读,开多久都不会吵醒任何人<br>
-工程细节在<a href="/admin/window">窗口管理页</a>,现在是北京时间 ${esc(bjTime(now))}</div>
+工程细节在<a href="/admin/window">窗口管理页</a> · <a href="/admin/session">会话管理</a>,现在是北京时间 ${esc(bjTime(now))}</div>
 </body></html>`;
 }
 

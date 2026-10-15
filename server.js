@@ -48,6 +48,7 @@ import { mountHomePage } from "./home-page.js";
 import { guardSpeech } from "./speech-guard.js";
 import { ThresholdState, DEFAULT_THRESHOLD_FILE } from "./window-threshold-state.js";
 import { mountWindowAdmin } from "./window-admin.js";
+import { mountSessionAdmin } from "./session-admin.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -79,7 +80,11 @@ const EFFORT_OVERRIDES = Object.fromEntries(
   (process.env.THINK_EFFORT_OVERRIDES || "claude-fable-5=low")
     .split(",").map((s) => s.split("=").map((x) => x.trim())).filter((p) => p[0] && p[1])
 );
-const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT_OVERRIDES[upstreamModelName(model)] || EFFORT;
+const effortFor = (model) => {
+  const selected = sessions?.state.selection;
+  return selected && resolveModel(selected.model) === model ? selected.effort
+    : EFFORT_OVERRIDES[model] || EFFORT_OVERRIDES[upstreamModelName(model)] || EFFORT;
+};
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const MCP_CONFIG = process.env.MCP_CONFIG || ".mcp.json";
 const FORWARD_THINKING = process.env.FORWARD_THINKING !== "0";
@@ -147,8 +152,13 @@ catch (e) {
 }
 let nativeSessionId = null, resumeExpectedId = null, recoveryTimer = null;
 let resumeSupported = null;
+let sessionRevision = randomUUID(), sessionControlBusy = false, retiringProc = null, pendingUserInputs = 0, scheduledSessionTasks = 0;
+function scheduleSessionTask(fn) {
+  scheduledSessionTasks++;
+  setTimeout(() => { scheduledSessionTasks--; fn(); }, 0);
+}
 const recoveryStatus = () => ({ enabled: !!sessionDir, phase: recovery.phase, mode: recovery.mode, error: recovery.error });
-const internalReady = () => !sessionDir || (recovery.phase === "ready" && !!nativeSessionId && !!proc);
+const internalReady = () => !sessionControlBusy && (!sessionDir || (recovery.phase === "ready" && !!nativeSessionId && !!proc));
 function rejectSink(sink, message, status = 503) {
   // Internal sinks must never turn a failed round into a normal/pushed reply.
   if (sink?.error) sink.error(message, status);
@@ -286,7 +296,7 @@ function compactCollisionHalt(reason) {
   ).catch((e) => log("[tg-err]", e.message));
   // 自愈:归档轮带 allowRecover,允许它自己把会话从检查点恢复回来(恢复流程本身
   // 仍是失败即停的那套校验,所以这不放松任何底线,只是不用等她的消息来当钥匙)。
-  if (WINDOW_AUTO_ARCHIVE) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, windowLimitNow()), "collision"), 0);
+  if (WINDOW_AUTO_ARCHIVE) scheduleSessionTask(() => autoArchiveTurn(windowPct(windowTokens, windowLimitNow()), "collision"));
 }
 
 // replace 模式下锚点已并入正文,SOUL_ANCHOR 不再参与组装 —— 有人设了它却没生效是最难查的那种。
@@ -329,7 +339,7 @@ function pushReceipt(t, status) {
     requestedModel: t.requestedModel || null, configuredModel: spawnedModel,
     upstreamModel: t.upstreamModel || null,
     effectiveEffort: effortFor(spawnedModel),
-    effortSource: EFFORT_OVERRIDES[spawnedModel] || EFFORT_OVERRIDES[upstreamModelName(spawnedModel)] ? "按模型覆盖" : "全局默认",
+    effortSource: sessions?.state.selection ? "会话管理页" : EFFORT_OVERRIDES[spawnedModel] || EFFORT_OVERRIDES[upstreamModelName(spawnedModel)] ? "按模型覆盖" : "全局默认",
     thinkingSeen: !!t.thinkingSeen, signatureSeen: !!t.signatureSeen,
     signatureLength: t.signatureLength || 0,
     startedAt: t.startedAt, completedAt: Date.now(), status,
@@ -500,7 +510,7 @@ let proc = null, outBuf = "", busy = false;
 // exec limit (~128 KiB). Keep it out of argv and prepend it to the first
 // stream-json user input instead; stdin has no such limit.
 let recoveryHistory = "";
-let spawnedSystem = sessions?.state.context?.system || "", spawnedModel = resolveModel(sessions?.state.context?.model || MODEL);
+let spawnedSystem = sessions?.state.context?.system || "", spawnedModel = resolveModel(sessions?.state.selection?.model || sessions?.state.context?.model || MODEL);
 // 实际生效的模式(replace 可能因 CLI 不支持而降级)。spawn 之前是 null ——
 // /debug 那里如实报「还没起进程」,不要让面板显示一个还没验证过的 replace(手册 §9:
 // 一个看起来对、其实还没生效的读数,比没有读数更能把人带沟里)。
@@ -575,7 +585,7 @@ function spawnClaude(kelivoSystem, model) {
   windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
   dirty = savedGate?.dirty || false; compactBlocks = 0; archiveAttempts = 0; transcript = savedGate?.transcript || [];
   lastArchiveAt = savedGate?.lastArchiveAt || null;
-  if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); setTimeout(() => replayTurn(carry), 0); }
+  if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); scheduleSessionTask(() => replayTurn(carry)); }
   // 上游凭据:设了长期令牌就直连订阅,否则照旧经 CPA 中转。
   // ⚠️ 直连必须连 ANTHROPIC_AUTH_TOKEN/BASE_URL 一起摘 —— 它们优先级更高,
   //    不摘就会静默压过长期令牌(理由与实测见 auth-env.js 顶部)。
@@ -810,7 +820,7 @@ function handleEvent(ev) {
     if (turn.kind === "archive" && !archivedOk) {
       const src = turn.archiveSrc || "window";
       log("[archive] 这一轮没写进 OB(第", archiveAttempts, "次尝试)");
-      if (archiveAttempts < ARCHIVE_MAX_ATTEMPTS) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, windowLimitNow()), src), 0);
+      if (archiveAttempts < ARCHIVE_MAX_ATTEMPTS) scheduleSessionTask(() => autoArchiveTurn(windowPct(windowTokens, windowLimitNow()), src));
       else tgSend(
         "⚠️ 让他自动归档试了两次都没成功写进 OB(可能是记忆服务出问题了)。\n" +
         "压缩不会再被一直拦着,这段有丢失风险 —— 要不要你亲口让他存一次?"
@@ -866,6 +876,7 @@ function recordTranscript(role, text) {
   transcript = trimTranscript(transcript, COMPACT_REPLAY_MAX_CHARS);
 }
 function enqueue(item) {
+  if (sessionControlBusy) return rejectSink(item.sse, "正在准备会话，请稍后重发这条消息。", 409);
   if (recovery.phase === "failed") return rejectSink(item.sse, "会话未就绪：" + recovery.error);
   // allowRecover:撞车自愈的归档轮专用 —— 允许内部轮自己触发恢复流程(恢复校验
   // 本身仍是失败即停,底线不动),其余内部轮照旧等她的消息来当钥匙。
@@ -879,9 +890,10 @@ function pump() {
   if (busy || !queue.length) return;
   const item = queue.shift();
   busy = true;
+  sessionRevision = randomUUID();
 
   // 世界书或模型变了就重启进程再喂(让新设定/新模型生效)
-  const wantModel = item.model || spawnedModel;
+  const wantModel = sessions?.state.selection ? resolveModel(sessions.state.selection.model) : item.model || spawnedModel;
   if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
   try { ensureProc(item.system, wantModel); }
   catch (e) { const reason = sessionReason(e); rejectSink(item.sse, "恢复失败：" + reason); blockRecovery(reason); return; }
@@ -1071,6 +1083,70 @@ function adminSnapshot() {
 }
 if (SHIM_KEY) mountWindowAdmin(app, { key: SHIM_KEY, snapshot: adminSnapshot, log });
 else log("[admin] SHIM_KEY 未设置,/admin/window 不挂载");
+
+// Session actions are separate from the read-only progress page. Holding this
+// lock across child shutdown prevents a second CLI from opening the same file.
+const controlIsBusy = () => sessionControlBusy || !!retiringProc || busy || !!turn || queue.length > 0 ||
+  pendingUserInputs > 0 || scheduledSessionTasks > 0 || replayPending || recovery.phase === "restoring";
+function sessionControlSnapshot() {
+  return { enabled: !!sessions?.enabled, phase: recovery.phase, busy: controlIsBusy(),
+    revision: sessionRevision, model: spawnedModel, effort: effortFor(spawnedModel),
+    pinned: !!sessions?.state.selection, models: [...new Set([spawnedModel, ...MODELS])] };
+}
+async function stopSessionProcess() {
+  const old = proc;
+  proc = null; // Old callbacks must not touch the next session.
+  if (!old || old.exitCode !== null || old.signalCode !== null) return;
+  retiringProc = old;
+  await new Promise((resolve, reject) => {
+    let timeout, force;
+    const done = () => { retiringProc = null; clearTimeout(timeout); clearTimeout(force); resolve(); };
+    old.once("close", done);
+    force = setTimeout(() => old.kill("SIGKILL"), 3000);
+    timeout = setTimeout(() => reject(new Error("cli_stop_timeout")), 5000);
+    old.kill();
+  });
+}
+async function controlSession({ action, revision, model, effort }) {
+  if (!sessions?.enabled) return { ok: false, status: 503, message: "会话存储不可用，操作未执行。" };
+  if (controlIsBusy()) return { ok: false, message: "后台正在回复、恢复、压缩或调用工具，请等这一轮结束后再试。" };
+  if (revision !== sessionRevision) return { ok: false, message: "会话状态已变化，请刷新后重新确认。" };
+  model = typeof model === "string" ? resolveModel(model) : "";
+  if (action === "fresh" && (!sessionControlSnapshot().models.includes(model) || !["low", "medium", "high", "max"].includes(effort))) {
+    return { ok: false, status: 400, message: "请选择列表中的模型与思考档位。" };
+  }
+  sessionControlBusy = true;
+  try {
+    if (action === "fresh") {
+      sessions.startFresh({ model, effort, system: spawnedSystem });
+      spawnedModel = model;
+    }
+    sessionRevision = randomUUID();
+    clearTimeout(recoveryTimer);
+    await stopSessionProcess();
+    // Validate a preserved checkpoint now. A corrupt checkpoint must never be
+    // silently converted into an empty session by the restart button.
+    if (action === "restart") sessions.restore();
+    nativeSessionId = null; resumeExpectedId = null; recoveryHistory = ""; outBuf = "";
+    recovery.phase = "pending"; recovery.mode = null; recovery.error = null;
+    cliThreshold = null; promptMode = null;
+    if (action === "fresh") {
+      windowTokens = 0; windowWarned = false; windowAutoArchived = false;
+      compactions = 0; lastCompactAt = null; lastCompactPre = 0;
+      dirty = false; compactBlocks = 0; archiveAttempts = 0; transcript = []; lastArchiveAt = null;
+    }
+    log("[session-admin]", action, "prepared");
+    return { ok: true, message: action === "fresh"
+      ? "旧会话已备份，下一段的模型与档位已保存。现在可以从 Telegram 或 Kelivo 发出下一条消息。"
+      : "当前会话已保留，连接已准备好。下一条真实消息会续接已确认的历史。" };
+  } catch (e) {
+    // A failed pre-commit backup leaves the current running session usable.
+    if (!proc) { recovery.phase = "failed"; recovery.error = sessionReason(e); nativeSessionId = null; }
+    log("[session-admin] failed", sessionReason(e));
+    return { ok: false, status: 503, message: "操作未完成，旧会话资料仍保留。请检查会话存储或连接后再试。" };
+  } finally { sessionControlBusy = false; }
+}
+if (SHIM_KEY) mountSessionAdmin(app, { key: SHIM_KEY, snapshot: sessionControlSnapshot, control: controlSession, log });
 
 // 家门口 /home(home-page.js):「欢迎回家,安安」+ 各房间的真实灯火。
 // 与管理页同一把钥匙、同一套只读纪律;快照里只有元数据,没有任何正文。
@@ -2220,11 +2296,13 @@ function handleMessages(req, res) {
   const stream = body.stream !== false;
   // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
   const requestedModel = resolveModel(body.model);
-  const model = MODELS.includes(requestedModel) ? requestedModel : spawnedModel;
+  const model = sessions?.state.selection ? resolveModel(sessions.state.selection.model)
+    : MODELS.includes(requestedModel) ? requestedModel : spawnedModel;
   const key = requestKey(body, req.get("idempotency-key") || req.get("x-shim-message-id") || "");
   const sse = stream ? makeSSE(res) : makeCollector(res);
   // 急停 / 看活儿:Kelivo 这边同样管用。⚠️ 这条别删 —— 她在哪个前端说「停」都该停,
   // 一个安全阀只有一半入口有,等于没有。
+  pendingUserInputs++;
   (async () => {
     const ctl = images.length ? null : await handsControlText(text);
     if (ctl === null) return submitTurn(text, images, sse, { system, model, src: "kelivo", key, requestedModel: body.model || null });
@@ -2234,7 +2312,7 @@ function handleMessages(req, res) {
   })().catch((e) => {
     log("[hands-ctl-err]", e.message);
     submitTurn(text, images, sse, { system, model, src: "kelivo", key });
-  });
+  }).finally(() => { pendingUserInputs--; });
 }
 
 // Kelivo 的 Claude 类型 Base URL 填 /v1 会拼成 /v1/messages;填根则是 /messages。两个都接。
