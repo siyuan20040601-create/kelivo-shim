@@ -16,7 +16,10 @@ export function mountSessionAdmin(app, { key, snapshot, control, log = () => {} 
   const logins = new Map();
   let fails = [];
   app.use(BASE, express.urlencoded({ extended: false, limit: "4kb" }), (req, res, next) => {
-    res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
+    // no-referrer makes native form POSTs carry Origin: null, which our
+    // same-origin guard correctly rejects. Keep origin on same-site forms;
+    // still omit the referrer entirely when navigating to another origin.
+    res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "same-origin",
       "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" });
     if (req.method === "POST" && req.get("sec-fetch-site") === "cross-site") return res.status(403).send(loginPage("请从本页提交操作。"));
     if (req.method === "POST" && req.get("origin")) {
